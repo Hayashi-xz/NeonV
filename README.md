@@ -30,7 +30,7 @@ Our philosophy is simple: **VPN tools should just work.**
 
 1. Go to the **Releases** tab on the right side of this repository and download the latest zip archive.
 2. Extract the archive to a folder of your choice.
-3. Run `NeonV.exe` (Administrator rights may be required to initialize the virtual TUN adapter).
+3. Run `NeonV.exe` (requires Administrator privileges to start).
 
 ## Building from Source
 
