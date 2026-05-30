@@ -24,8 +24,7 @@ Our philosophy is simple: **VPN tools should just work.**
 
 ## Requirements
 
-* **.NET Desktop Runtime** installed on your system.
-* **`sing-box.exe`** and **`wintun.dll`** are required for core functionality, but **they are already included in the release package**, so you do not need to download them separately.
+* **`sing-box.exe`** and **`wintun.dll`** are required for core functionality, but **they are already included in the release package**, so you do not need to download anything. The client is fully self-contained and does not require any pre-installed .NET runtimes.
 
 ## Installation & Usage
 
