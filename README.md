@@ -1,9 +1,8 @@
-<img width="900" height="650" alt="noname" src="https://github.com/user-attachments/assets/b97eafb9-d6c3-46bf-b3c2-32c3449dbce4" />
-<img width="900" height="650" alt="noname2" src="https://github.com/user-attachments/assets/74e3ddd3-bd47-4eaf-b0f9-480f2080836c" />
-
 # NeonV — VPN & Proxy Client for Windows
 
 NeonV is a minimalist, elegant, and user-friendly graphical client for the **Sing-box** core on Windows. It supports both **TUN Mode** (full VPN) and **System Proxy** mode.
+
+<img width="1476" height="1066" alt="home" src="https://github.com/user-attachments/assets/72a8f32c-8266-4051-b353-d9ef60125ca9" />
 
 ## Why NeonV?
 
