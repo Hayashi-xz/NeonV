@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -13,9 +14,11 @@ using System.Net.Http;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -29,10 +32,526 @@ using System.Windows.Media.Effects;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Brush = System.Windows.Media.Brush;
+using Brushes = System.Windows.Media.Brushes;
 using Color = System.Windows.Media.Color;
 using Forms = System.Windows.Forms;
 
 namespace NeonV;
+
+public static class Direct2DEmojiRenderer
+{
+    private const int CanvasSize = 64;
+    private const uint CLSCTX_INPROC_SERVER = 1;
+    private const uint WICBitmapCacheOnLoad = 2;
+    private const uint D2D1_FACTORY_TYPE_MULTI_THREADED = 1;
+    private const uint D2D1_RENDER_TARGET_TYPE_DEFAULT = 0;
+    private const uint DXGI_FORMAT_B8G8R8A8_UNORM = 87;
+    private const uint D2D1_ALPHA_MODE_PREMULTIPLIED = 1;
+    private const uint D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT = 4;
+    private const uint DWRITE_FACTORY_TYPE_SHARED = 0;
+    private const uint DWRITE_FONT_WEIGHT_NORMAL = 400;
+    private const uint DWRITE_FONT_STYLE_NORMAL = 0;
+    private const uint DWRITE_FONT_STRETCH_NORMAL = 5;
+    private const uint DWRITE_TEXT_ALIGNMENT_CENTER = 2;
+    private const uint DWRITE_PARAGRAPH_ALIGNMENT_CENTER = 2;
+    private const uint DWRITE_MEASURING_MODE_NATURAL = 0;
+
+    private static Guid CLSID_WICImagingFactory = new("cacaf262-9370-4615-a13b-9f5539da4c0a");
+    private static Guid IID_IWICImagingFactory = new("ec5ec8a9-c395-4314-9c77-54d7a935ff70");
+    private static Guid GUID_WICPixelFormat32bppPBGRA = new("6fddc324-4e03-4bfe-b185-3d77768dc910");
+    private static Guid IID_ID2D1Factory = new("06152247-6f50-465a-9245-118bfd3b6007");
+    private static Guid IID_IDWriteFactory = new("b859ee5a-d838-4b5b-a2e8-1adc7d93db48");
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct D2D1_PIXEL_FORMAT
+    {
+        public uint format;
+        public uint alphaMode;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct D2D1_RENDER_TARGET_PROPERTIES
+    {
+        public uint type;
+        public D2D1_PIXEL_FORMAT pixelFormat;
+        public float dpiX;
+        public float dpiY;
+        public uint usage;
+        public uint minLevel;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct D2D1_COLOR_F
+    {
+        public float r;
+        public float g;
+        public float b;
+        public float a;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct D2D1_RECT_F
+    {
+        public float left;
+        public float top;
+        public float right;
+        public float bottom;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int WicCreateBitmapDelegate(IntPtr self, uint width, uint height, ref Guid pixelFormat, uint option, out IntPtr bitmap);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int WicCopyPixelsDelegate(IntPtr self, IntPtr prc, uint cbStride, uint cbBufferSize, [Out] byte[] pbBuffer);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int D2DCreateWicBitmapRenderTargetDelegate(IntPtr self, IntPtr target, ref D2D1_RENDER_TARGET_PROPERTIES renderTargetProperties, out IntPtr renderTarget);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int D2DCreateSolidColorBrushDelegate(IntPtr self, ref D2D1_COLOR_F color, IntPtr brushProperties, out IntPtr solidColorBrush);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate void D2DBeginDrawDelegate(IntPtr self);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate void D2DClearDelegate(IntPtr self, ref D2D1_COLOR_F clearColor);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate void D2DDrawTextDelegate(IntPtr self, [MarshalAs(UnmanagedType.LPWStr)] string str, uint stringLength, IntPtr textFormat, ref D2D1_RECT_F layoutRect, IntPtr defaultForegroundBrush, uint options, uint measuringMode);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int D2DEndDrawDelegate(IntPtr self, IntPtr tag1, IntPtr tag2);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int DWriteCreateTextFormatDelegate(IntPtr self, [MarshalAs(UnmanagedType.LPWStr)] string fontFamilyName, IntPtr fontCollection, uint fontWeight, uint fontStyle, uint fontStretch, float fontSize, [MarshalAs(UnmanagedType.LPWStr)] string localeName, out IntPtr textFormat);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int DWriteSetAlignmentDelegate(IntPtr self, uint alignment);
+
+    [DllImport("ole32.dll")]
+    private static extern int CoCreateInstance(ref Guid rclsid, IntPtr pUnkOuter, uint dwClsContext, ref Guid riid, out IntPtr ppv);
+
+    [DllImport("d2d1.dll")]
+    private static extern int D2D1CreateFactory(uint factoryType, ref Guid riid, IntPtr pFactoryOptions, out IntPtr ppIFactory);
+
+    [DllImport("dwrite.dll")]
+    private static extern int DWriteCreateFactory(uint factoryType, ref Guid iid, out IntPtr factory);
+
+    private static readonly object _renderLock = new();
+    private static readonly ConcurrentDictionary<string, BitmapSource?> _cache = new();
+
+    private static IntPtr _wicFactory;
+    private static IntPtr _wicBitmap;
+    private static IntPtr _d2dFactory;
+    private static IntPtr _renderTarget;
+    private static IntPtr _sentinelBrush;
+    private static IntPtr _dwriteFactory;
+    private static IntPtr _textFormat;
+
+    private static WicCopyPixelsDelegate? _wicCopyPixels;
+    private static D2DBeginDrawDelegate? _beginDraw;
+    private static D2DClearDelegate? _clear;
+    private static D2DDrawTextDelegate? _drawText;
+    private static D2DEndDrawDelegate? _endDraw;
+
+    private static T GetVtableMethod<T>(IntPtr comObject, int slot) where T : Delegate
+    {
+        IntPtr vtable = Marshal.ReadIntPtr(comObject);
+        IntPtr methodPtr = Marshal.ReadIntPtr(vtable, slot * IntPtr.Size);
+        return Marshal.GetDelegateForFunctionPointer<T>(methodPtr);
+    }
+
+    private static bool EnsureInitialized()
+    {
+        if (_renderTarget != IntPtr.Zero && _textFormat != IntPtr.Zero && _sentinelBrush != IntPtr.Zero)
+            return true;
+
+        try
+        {
+            if (_wicFactory == IntPtr.Zero)
+            {
+                if (CoCreateInstance(ref CLSID_WICImagingFactory, IntPtr.Zero, CLSCTX_INPROC_SERVER, ref IID_IWICImagingFactory, out _wicFactory) < 0)
+                    return false;
+            }
+
+            if (_wicBitmap == IntPtr.Zero)
+            {
+                var createBitmap = GetVtableMethod<WicCreateBitmapDelegate>(_wicFactory, 17);
+                if (createBitmap(_wicFactory, CanvasSize, CanvasSize, ref GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, out _wicBitmap) < 0)
+                    return false;
+                _wicCopyPixels = GetVtableMethod<WicCopyPixelsDelegate>(_wicBitmap, 7);
+            }
+
+            if (_d2dFactory == IntPtr.Zero)
+            {
+                if (D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, ref IID_ID2D1Factory, IntPtr.Zero, out _d2dFactory) < 0)
+                    return false;
+            }
+
+            if (_renderTarget == IntPtr.Zero)
+            {
+                var rtProps = new D2D1_RENDER_TARGET_PROPERTIES
+                {
+                    type = D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                    pixelFormat = new D2D1_PIXEL_FORMAT { format = DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED },
+                    dpiX = 96.0f,
+                    dpiY = 96.0f,
+                    usage = 0,
+                    minLevel = 0
+                };
+                var createRt = GetVtableMethod<D2DCreateWicBitmapRenderTargetDelegate>(_d2dFactory, 13);
+                if (createRt(_d2dFactory, _wicBitmap, ref rtProps, out _renderTarget) < 0)
+                    return false;
+
+                _beginDraw = GetVtableMethod<D2DBeginDrawDelegate>(_renderTarget, 48);
+                _clear = GetVtableMethod<D2DClearDelegate>(_renderTarget, 47);
+                _drawText = GetVtableMethod<D2DDrawTextDelegate>(_renderTarget, 27);
+                _endDraw = GetVtableMethod<D2DEndDrawDelegate>(_renderTarget, 49);
+            }
+
+            if (_sentinelBrush == IntPtr.Zero)
+            {
+                var sentinelColor = new D2D1_COLOR_F { r = 254f / 255f, g = 1f / 255f, b = 254f / 255f, a = 1.0f };
+                var createBrush = GetVtableMethod<D2DCreateSolidColorBrushDelegate>(_renderTarget, 8);
+                if (createBrush(_renderTarget, ref sentinelColor, IntPtr.Zero, out _sentinelBrush) < 0)
+                    return false;
+            }
+
+            if (_dwriteFactory == IntPtr.Zero)
+            {
+                if (DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, ref IID_IDWriteFactory, out _dwriteFactory) < 0)
+                    return false;
+            }
+
+            if (_textFormat == IntPtr.Zero)
+            {
+                var createTextFormat = GetVtableMethod<DWriteCreateTextFormatDelegate>(_dwriteFactory, 15);
+                if (createTextFormat(_dwriteFactory, "Segoe UI Emoji", IntPtr.Zero, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 42.0f, "", out _textFormat) < 0)
+                    return false;
+
+                GetVtableMethod<DWriteSetAlignmentDelegate>(_textFormat, 3)(_textFormat, DWRITE_TEXT_ALIGNMENT_CENTER);
+                GetVtableMethod<DWriteSetAlignmentDelegate>(_textFormat, 4)(_textFormat, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            }
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void ResetRenderTarget()
+    {
+        if (_sentinelBrush != IntPtr.Zero) { Marshal.Release(_sentinelBrush); _sentinelBrush = IntPtr.Zero; }
+        if (_renderTarget != IntPtr.Zero) { Marshal.Release(_renderTarget); _renderTarget = IntPtr.Zero; }
+        _beginDraw = null;
+        _clear = null;
+        _drawText = null;
+        _endDraw = null;
+    }
+
+    public static BitmapSource? GetEmojiImage(string emoji)
+    {
+        if (string.IsNullOrEmpty(emoji)) return null;
+        return _cache.GetOrAdd(emoji, RenderEmojiInternal);
+    }
+
+    private static BitmapSource? RenderEmojiInternal(string emoji)
+    {
+        lock (_renderLock)
+        {
+            try
+            {
+                if (!EnsureInitialized()) return null;
+
+                var clearColor = new D2D1_COLOR_F { r = 0, g = 0, b = 0, a = 0 };
+                var rect = new D2D1_RECT_F { left = 0, top = 0, right = CanvasSize, bottom = CanvasSize };
+
+                _beginDraw!(_renderTarget);
+                _clear!(_renderTarget, ref clearColor);
+                _drawText!(_renderTarget, emoji, (uint)emoji.Length, _textFormat, ref rect, _sentinelBrush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, DWRITE_MEASURING_MODE_NATURAL);
+                int hr = _endDraw!(_renderTarget, IntPtr.Zero, IntPtr.Zero);
+                if (hr < 0)
+                {
+                    ResetRenderTarget();
+                    return null;
+                }
+
+                byte[] pixels = new byte[CanvasSize * CanvasSize * 4];
+                if (_wicCopyPixels!(_wicBitmap, IntPtr.Zero, CanvasSize * 4, (uint)pixels.Length, pixels) < 0)
+                    return null;
+
+                int minX = CanvasSize, minY = CanvasSize, maxX = -1, maxY = -1;
+                bool hasColorData = false;
+
+                for (int y = 0; y < CanvasSize; y++)
+                {
+                    int rowOffset = y * CanvasSize * 4;
+                    for (int x = 0; x < CanvasSize; x++)
+                    {
+                        int idx = rowOffset + x * 4;
+                        byte b = pixels[idx];
+                        byte g = pixels[idx + 1];
+                        byte r = pixels[idx + 2];
+                        byte a = pixels[idx + 3];
+
+                        if (a > 4)
+                        {
+                            if (x < minX) minX = x;
+                            if (x > maxX) maxX = x;
+                            if (y < minY) minY = y;
+                            if (y > maxY) maxY = y;
+
+                            if (!hasColorData && a > 30)
+                            {
+                                if (g > 4 || Math.Abs(r - b) > 6 || r < a * 0.5)
+                                    hasColorData = true;
+                            }
+                        }
+                    }
+                }
+
+                if (minX > maxX || minY > maxY || !hasColorData)
+                    return null;
+
+                int w = maxX - minX + 1;
+                int h = maxY - minY + 1;
+                int size = Math.Min(CanvasSize, Math.Max(w, h) + 4);
+                int startX = Math.Clamp(minX - (size - w) / 2, 0, CanvasSize - size);
+                int startY = Math.Clamp(minY - (size - h) / 2, 0, CanvasSize - size);
+
+                byte[] cropped = new byte[size * size * 4];
+                int stride = size * 4;
+                for (int y = 0; y < size; y++)
+                {
+                    Buffer.BlockCopy(pixels, ((startY + y) * CanvasSize + startX) * 4, cropped, y * stride, stride);
+                }
+
+                var bmp = BitmapSource.Create(size, size, 96, 96, PixelFormats.Pbgra32, null, cropped, stride);
+                bmp.Freeze();
+                return bmp;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
+    public static void Dispose()
+    {
+        lock (_renderLock)
+        {
+            ResetRenderTarget();
+            if (_textFormat != IntPtr.Zero) { Marshal.Release(_textFormat); _textFormat = IntPtr.Zero; }
+            if (_dwriteFactory != IntPtr.Zero) { Marshal.Release(_dwriteFactory); _dwriteFactory = IntPtr.Zero; }
+            if (_d2dFactory != IntPtr.Zero) { Marshal.Release(_d2dFactory); _d2dFactory = IntPtr.Zero; }
+            if (_wicBitmap != IntPtr.Zero) { Marshal.Release(_wicBitmap); _wicBitmap = IntPtr.Zero; }
+            if (_wicFactory != IntPtr.Zero) { Marshal.Release(_wicFactory); _wicFactory = IntPtr.Zero; }
+            _wicCopyPixels = null;
+        }
+    }
+}
+
+public static class EmojiText
+{
+    public static readonly DependencyProperty TextProperty = DependencyProperty.RegisterAttached(
+        "Text",
+        typeof(string),
+        typeof(EmojiText),
+        new PropertyMetadata(null, OnTextChanged));
+
+    public static string? GetText(DependencyObject obj) => (string?)obj.GetValue(TextProperty);
+    public static void SetText(DependencyObject obj, string? value) => obj.SetValue(TextProperty, value);
+
+    private static bool IsEmojiCodePoint(int cp) =>
+        cp is (>= 0x1F000 and <= 0x1FAFF)
+            or (>= 0x2600 and <= 0x27BF)
+            or (>= 0x2300 and <= 0x23FF)
+            or 0x2B50 or 0x2B55 or 0x2934 or 0x2935 or 0x3030 or 0x303D or 0x3297 or 0x3299 or 0x203C or 0x2049 or 0x2122 or 0x2139 or (>= 0x2194 and <= 0x21AA) or 0x24C2 or 0x25AA or 0x25AB or 0x25B6 or 0x25C0 or (>= 0x25FB and <= 0x25FE);
+
+    private static int SafeGetCodePoint(string s, int index)
+    {
+        if (index < 0 || index >= s.Length) return 0;
+        if (char.IsHighSurrogate(s[index]))
+        {
+            if (index + 1 < s.Length && char.IsLowSurrogate(s[index + 1]))
+                return char.ConvertToUtf32(s, index);
+            return s[index];
+        }
+        return s[index];
+    }
+
+    private static bool IsCandidateCluster(string cluster)
+    {
+        if (string.IsNullOrEmpty(cluster)) return false;
+        if (cluster.Contains('\uFE0F') || cluster.Contains('\u20E3') || cluster.Contains('\u200D'))
+            return true;
+        return IsEmojiCodePoint(SafeGetCodePoint(cluster, 0));
+    }
+
+    private static bool HasAnyCandidate(string text)
+    {
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (char.IsHighSurrogate(c))
+            {
+                if (i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+                {
+                    if (IsEmojiCodePoint(char.ConvertToUtf32(text, i))) return true;
+                    i++;
+                }
+                continue;
+            }
+            if (c is '\uFE0F' or '\u20E3' or '\u200D' || IsEmojiCodePoint(c))
+                return true;
+        }
+        return false;
+    }
+
+    private static void OnTextChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is not TextBlock tb) return;
+
+        string text = e.NewValue as string ?? "";
+        tb.Inlines.Clear();
+        tb.Text = string.Empty;
+
+        if (string.IsNullOrEmpty(text))
+            return;
+
+        if (!HasAnyCandidate(text))
+        {
+            tb.Text = text;
+            return;
+        }
+
+        double emojiSize = Math.Ceiling((double.IsNaN(tb.FontSize) || tb.FontSize <= 0 ? 14 : tb.FontSize) * 1.15);
+        var plainSb = new System.Text.StringBuilder();
+        var enumerator = StringInfo.GetTextElementEnumerator(text);
+
+        while (enumerator.MoveNext())
+        {
+            string cluster = enumerator.GetTextElement();
+            if (IsCandidateCluster(cluster))
+            {
+                var bmp = Direct2DEmojiRenderer.GetEmojiImage(cluster);
+                if (bmp != null)
+                {
+                    if (plainSb.Length > 0)
+                    {
+                        tb.Inlines.Add(new Run(plainSb.ToString()));
+                        plainSb.Clear();
+                    }
+
+                    var img = new System.Windows.Controls.Image
+                    {
+                        Source = bmp,
+                        Width = emojiSize,
+                        Height = emojiSize,
+                        Stretch = Stretch.Uniform,
+                        VerticalAlignment = VerticalAlignment.Center,
+                        Margin = new Thickness(0, 0, 1, 0)
+                    };
+                    RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
+                    tb.Inlines.Add(new InlineUIContainer(img) { BaselineAlignment = BaselineAlignment.Center });
+                    continue;
+                }
+            }
+            plainSb.Append(cluster);
+        }
+
+        if (plainSb.Length > 0)
+            tb.Inlines.Add(new Run(plainSb.ToString()));
+    }
+}
+
+public class RoundedRectClipConverter : IMultiValueConverter
+{
+    public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
+    {
+        if (values.Length >= 2 && values[0] is double w && values[1] is double h && w > 0 && h > 0)
+        {
+            double r = parameter is string s && double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var pr) ? pr : 13;
+            var geo = new RectangleGeometry(new Rect(0, 0, w, h), r, r);
+            geo.Freeze();
+            return geo;
+        }
+        return Geometry.Empty;
+    }
+
+    public object[] ConvertBack(object value, Type[] targetTypes, object parameter, CultureInfo culture) => throw new NotSupportedException();
+}
+
+public static class JobObjectManager
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr hJob, int JobObjectInfoClass, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    private static IntPtr _jobHandle;
+
+    public static void AddProcess(IntPtr handle)
+    {
+        if (_jobHandle == IntPtr.Zero)
+        {
+            _jobHandle = CreateJobObject(IntPtr.Zero, null);
+            int length = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+            IntPtr extendedInfoPtr = Marshal.AllocHGlobal(length);
+            var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+            {
+                BasicLimitInformation = new JOBOBJECT_BASIC_LIMIT_INFORMATION { LimitFlags = 0x2000 }
+            };
+            Marshal.StructureToPtr(info, extendedInfoPtr, false);
+            SetInformationJobObject(_jobHandle, 9, extendedInfoPtr, (uint)length);
+            Marshal.FreeHGlobal(extendedInfoPtr);
+        }
+        AssignProcessToJobObject(_jobHandle, handle);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsage;
+        public UIntPtr PeakJobMemoryUsage;
+    }
+}
 
 public static class SystemProxyManager
 {
@@ -68,6 +587,404 @@ public static class SystemProxyManager
     }
 }
 
+public static class CountryFlagHelper
+{
+    private static readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(8) };
+    private static readonly ConcurrentDictionary<string, BitmapImage> _flagCache = new();
+    private static readonly ConcurrentDictionary<string, Task> _downloadTasks = new();
+    private static readonly ConcurrentDictionary<string, ConcurrentDictionary<VpnProfile, byte>> _waitingProfiles = new();
+
+    private static readonly ConcurrentDictionary<string, string> _geoIpCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, Task<string>> _geoIpTasks = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly SemaphoreSlim _geoIpSemaphore = new(3, 3);
+
+    private static readonly HashSet<string> _isoCountryCodes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ad","ae","af","ag","ai","al","am","ao","aq","ar","as","at","au","aw","ax","az",
+        "ba","bb","bd","be","bf","bg","bh","bi","bj","bl","bm","bn","bo","bq","br","bs","bt","bv","bw","by","bz",
+        "ca","cc","cd","cf","cg","ch","ci","ck","cl","cm","cn","co","cr","cu","cv","cw","cx","cy","cz",
+        "de","dj","dk","dm","do","dz",
+        "ec","ee","eg","eh","er","es","et",
+        "fi","fj","fk","fm","fo","fr",
+        "ga","gb","gd","ge","gf","gg","gh","gi","gl","gm","gn","gp","gq","gr","gs","gt","gu","gw","gy",
+        "hk","hm","hn","hr","ht","hu",
+        "id","ie","il","im","in","io","iq","ir","is","it",
+        "je","jm","jo","jp",
+        "ke","kg","kh","ki","km","kn","kp","kr","kw","ky","kz",
+        "la","lb","lc","li","lk","lr","ls","lt","lu","lv","ly",
+        "ma","mc","md","me","mf","mg","mh","mk","ml","mm","mn","mo","mp","mq","mr","ms","mt","mu","mv","mw","mx","my","mz",
+        "na","nc","ne","nf","ng","ni","nl","no","np","nr","nu","nz",
+        "om",
+        "pa","pe","pf","pg","ph","pk","pl","pm","pn","pr","ps","pt","pw","py",
+        "qa",
+        "re","ro","rs","ru","rw",
+        "sa","sb","sc","sd","se","sg","sh","si","sj","sk","sl","sm","sn","so","sr","ss","st","sv","sx","sy","sz",
+        "tc","td","tf","tg","th","tj","tk","tl","tm","tn","to","tr","tt","tv","tw","tz",
+        "ua","ug","um","us","uy","uz",
+        "va","vc","ve","vg","vi","vn","vu",
+        "wf","ws",
+        "ye","yt",
+        "za","zm","zw"
+    };
+
+    private static readonly HashSet<string> _ambiguousTlds = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "co","io","me","tv","cc","ai","gg","ly","to","sh","fm","ws","am","is","it","in","so","by","do","go","id","my","no","as","at","re","st","la","vc","ag","ms","tk","ml","ga","cf","gq","im","nu","bz"
+    };
+
+    private static readonly Dictionary<string, string> _nameToCountryCode = new(StringComparer.OrdinalIgnoreCase)
+    {
+        { "germany", "de" }, { "германия", "de" }, { "deutschland", "de" }, { "frankfurt", "de" }, { "франкфурт", "de" },
+        { "estonia", "ee" }, { "эстония", "ee" }, { "tallinn", "ee" }, { "таллин", "ee" },
+        { "finland", "fi" }, { "финляндия", "fi" }, { "helsinki", "fi" }, { "хельсинки", "fi" },
+        { "netherlands", "nl" }, { "нидерланды", "nl" }, { "holland", "nl" }, { "голландия", "nl" }, { "amsterdam", "nl" }, { "амстердам", "nl" },
+        { "russia", "ru" }, { "россия", "ru" }, { "moscow", "ru" }, { "москва", "ru" },
+        { "united states", "us" }, { "america", "us" }, { "сша", "us" }, { "америка", "us" }, { "usa", "us" },
+        { "poland", "pl" }, { "польша", "pl" }, { "warsaw", "pl" }, { "варшава", "pl" },
+        { "turkey", "tr" }, { "турция", "tr" }, { "istanbul", "tr" }, { "стамбул", "tr" },
+        { "sweden", "se" }, { "швеция", "se" }, { "stockholm", "se" }, { "стокгольм", "se" },
+        { "france", "fr" }, { "франция", "fr" }, { "paris", "fr" }, { "париж", "fr" },
+        { "japan", "jp" }, { "япония", "jp" }, { "tokyo", "jp" }, { "токио", "jp" },
+        { "singapore", "sg" }, { "сингапур", "sg" },
+        { "ukraine", "ua" }, { "украина", "ua" }, { "kyiv", "ua" }, { "киев", "ua" },
+        { "great britain", "gb" }, { "united kingdom", "gb" }, { "великобритания", "gb" }, { "england", "gb" }, { "англия", "gb" }, { "london", "gb" }, { "лондон", "gb" }, { "uk", "gb" },
+        { "canada", "ca" }, { "канада", "ca" },
+        { "kazakhstan", "kz" }, { "казахстан", "kz" }, { "almaty", "kz" }, { "алматы", "kz" },
+        { "iceland", "is" }, { "исландия", "is" },
+        { "latvia", "lv" }, { "латвия", "lv" }, { "riga", "lv" }, { "рига", "lv" },
+        { "lithuania", "lt" }, { "литва", "lt" }, { "vilnius", "lt" }, { "вильнюс", "lt" },
+        { "austria", "at" }, { "австрия", "at" }, { "vienna", "at" }, { "вена", "at" },
+        { "switzerland", "ch" }, { "швейцария", "ch" }, { "zurich", "ch" }, { "цюрих", "ch" },
+        { "hong kong", "hk" }, { "гонконг", "hk" },
+        { "norway", "no" }, { "норвегия", "no" },
+        { "denmark", "dk" }, { "дания", "dk" },
+        { "italy", "it" }, { "италия", "it" },
+        { "spain", "es" }, { "испания", "es" },
+        { "czech", "cz" }, { "чехия", "cz" },
+        { "romania", "ro" }, { "румыния", "ro" },
+        { "bulgaria", "bg" }, { "болгария", "bg" },
+        { "moldova", "md" }, { "молдова", "md" },
+        { "belarus", "by" }, { "беларусь", "by" },
+        { "georgia", "ge" }, { "грузия", "ge" },
+        { "armenia", "am" }, { "армения", "am" },
+        { "azerbaijan", "az" }, { "азербайджан", "az" },
+        { "uzbekistan", "uz" }, { "узбекистан", "uz" },
+        { "israel", "il" }, { "израиль", "il" },
+        { "india", "in" }, { "индия", "in" },
+        { "brazil", "br" }, { "бразилия", "br" },
+        { "korea", "kr" }, { "корея", "kr" },
+        { "taiwan", "tw" }, { "тайвань", "tw" },
+        { "ireland", "ie" }, { "ирландия", "ie" },
+        { "portugal", "pt" }, { "португалия", "pt" },
+        { "hungary", "hu" }, { "венгрия", "hu" },
+        { "serbia", "rs" }, { "сербия", "rs" },
+        { "slovakia", "sk" }, { "словакия", "sk" },
+        { "slovenia", "si" }, { "словения", "si" },
+        { "greece", "gr" }, { "греция", "gr" },
+        { "cyprus", "cy" }, { "кипр", "cy" },
+        { "dubai", "ae" }, { "дубай", "ae" }, { "оаэ", "ae" }, { "uae", "ae" },
+        { "australia", "au" }, { "австралия", "au" },
+        { "china", "cn" }, { "китай", "cn" }
+    };
+
+    public static string NormalizeCountryCode(string code)
+    {
+        if (string.IsNullOrWhiteSpace(code) || code.Length != 2) return "";
+        code = code.ToLowerInvariant();
+        if (code == "uk") code = "gb";
+        return _isoCountryCodes.Contains(code) ? code : "";
+    }
+
+    public static string StripFlagEmojisAndDuplicateCode(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return "";
+
+        var sb = new System.Text.StringBuilder(name.Length);
+        for (int i = 0; i < name.Length; i++)
+        {
+            if (char.IsSurrogatePair(name, i))
+            {
+                int cp = char.ConvertToUtf32(name, i);
+                if (cp is >= 0x1F1E6 and <= 0x1F1FF)
+                {
+                    i++;
+                    continue;
+                }
+                sb.Append(name[i]);
+                sb.Append(name[i + 1]);
+                i++;
+                continue;
+            }
+
+            if (name[i] is '\uFE0F' or '\uFE0E')
+            {
+                int lastIdx = sb.Length - 1;
+                if (lastIdx >= 0 && (char.IsLowSurrogate(sb[lastIdx]) || IsPotentialEmojiChar(sb[lastIdx])))
+                {
+                    sb.Append(name[i]);
+                }
+                continue;
+            }
+
+            sb.Append(name[i]);
+        }
+
+        string cleaned = Regex.Replace(sb.ToString(), @"\s{2,}", " ").Trim();
+        cleaned = Regex.Replace(cleaned, @"^([A-Za-z]{2})\s+(?=\[\1\]|\(\1\))", "", RegexOptions.IgnoreCase);
+        return string.IsNullOrWhiteSpace(cleaned) ? name.Trim() : cleaned;
+    }
+
+    private static bool IsPotentialEmojiChar(char c) => c >= 0x2000;
+
+    public static string DetectCountryCode(string name, string address)
+    {
+        if (string.IsNullOrWhiteSpace(name)) name = "";
+
+        for (int i = 0; i < name.Length; i++)
+        {
+            if (char.IsSurrogatePair(name, i))
+            {
+                int cp1 = char.ConvertToUtf32(name, i);
+                if (cp1 is >= 0x1F1E6 and <= 0x1F1FF && i + 2 < name.Length && char.IsSurrogatePair(name, i + 2))
+                {
+                    int cp2 = char.ConvertToUtf32(name, i + 2);
+                    if (cp2 is >= 0x1F1E6 and <= 0x1F1FF)
+                    {
+                        string emojiCode = $"{(char)('a' + (cp1 - 0x1F1E6))}{(char)('a' + (cp2 - 0x1F1E6))}";
+                        string normalized = NormalizeCountryCode(emojiCode);
+                        if (!string.IsNullOrEmpty(normalized)) return normalized;
+                    }
+                }
+                i++;
+            }
+        }
+
+        var bracketMatch = Regex.Match(name, @"\[([A-Za-z]{2})\d*\]|\(([A-Za-z]{2})\d*\)");
+        if (bracketMatch.Success)
+        {
+            string normalized = NormalizeCountryCode(bracketMatch.Groups[1].Value + bracketMatch.Groups[2].Value);
+            if (!string.IsNullOrEmpty(normalized)) return normalized;
+        }
+
+        foreach (var (key, code) in _nameToCountryCode)
+        {
+            if (key.Length <= 3)
+            {
+                if (Regex.IsMatch(name, $@"(?:^|[^a-zA-Zа-яА-ЯёЁ]){Regex.Escape(key)}(?:[^a-zA-Zа-яА-ЯёЁ]|$)", RegexOptions.IgnoreCase))
+                    return code;
+            }
+            else if (name.Contains(key, StringComparison.OrdinalIgnoreCase))
+            {
+                return code;
+            }
+        }
+
+        var upperCodeMatch = Regex.Match(name, @"(?:^|[\s|_\-•·/])([A-Z]{2})(?=[\s|_\-•·/\d]|$)");
+        if (upperCodeMatch.Success)
+        {
+            string normalized = NormalizeCountryCode(upperCodeMatch.Groups[1].Value);
+            if (!string.IsNullOrEmpty(normalized)) return normalized;
+        }
+
+        if (!string.IsNullOrEmpty(address) && !IPAddress.TryParse(address, out _))
+        {
+            var parts = address.Split('.');
+            if (parts.Length > 1)
+            {
+                string tld = parts[^1].ToLowerInvariant();
+                if (tld.Length == 2 && !_ambiguousTlds.Contains(tld))
+                {
+                    string normalized = NormalizeCountryCode(tld);
+                    if (!string.IsNullOrEmpty(normalized)) return normalized;
+                }
+            }
+        }
+
+        return "";
+    }
+
+    public static string CountryCodeToEmoji(string code)
+    {
+        if (string.IsNullOrEmpty(code) || code.Length != 2) return "?";
+        code = code.ToUpperInvariant();
+        int firstChar = 0x1F1E6 + (code[0] - 'A');
+        int secondChar = 0x1F1E6 + (code[1] - 'A');
+        return char.ConvertFromUtf32(firstChar) + char.ConvertFromUtf32(secondChar);
+    }
+
+    public static BitmapImage? GetFlagImage(string countryCode, VpnProfile? subscriber = null)
+    {
+        countryCode = NormalizeCountryCode(countryCode);
+        if (string.IsNullOrEmpty(countryCode)) return null;
+
+        if (_flagCache.TryGetValue(countryCode, out var cached)) return cached;
+
+        if (subscriber != null)
+        {
+            var set = _waitingProfiles.GetOrAdd(countryCode, _ => new ConcurrentDictionary<VpnProfile, byte>());
+            set.TryAdd(subscriber, 0);
+        }
+
+        _downloadTasks.GetOrAdd(countryCode, code => Task.Run(async () =>
+        {
+            try
+            {
+                byte[]? bytes = null;
+                try
+                {
+                    bytes = await _httpClient.GetByteArrayAsync($"https://flagcdn.com/w80/{code}.png");
+                }
+                catch
+                {
+                    try
+                    {
+                        bytes = await _httpClient.GetByteArrayAsync($"https://flagcdn.com/w40/{code}.png");
+                    }
+                    catch { }
+                }
+
+                if (bytes != null && bytes.Length > 0)
+                {
+                    using var ms = new MemoryStream(bytes);
+                    var img = new BitmapImage();
+                    img.BeginInit();
+                    img.CacheOption = BitmapCacheOption.OnLoad;
+                    img.StreamSource = ms;
+                    img.EndInit();
+                    img.Freeze();
+
+                    _flagCache[code] = img;
+
+                    if (_waitingProfiles.TryRemove(code, out var profiles))
+                    {
+                        Application.Current?.Dispatcher?.InvokeAsync(() =>
+                        {
+                            foreach (var p in profiles.Keys) p.NotifyVisuals();
+                        });
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                _downloadTasks.TryRemove(code, out _);
+            }
+        }));
+
+        return null;
+    }
+
+    private static bool IsPrivateOrInvalidIp(IPAddress ip)
+    {
+        if (IPAddress.IsLoopback(ip) || ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any) || ip.Equals(IPAddress.None))
+            return true;
+
+        if (ip.AddressFamily == AddressFamily.InterNetwork)
+        {
+            var b = ip.GetAddressBytes();
+            if (b[0] == 0 || b[0] == 10 || b[0] == 127) return true;
+            if (b[0] == 169 && b[1] == 254) return true;
+            if (b[0] == 172 && b[1] is >= 16 and <= 31) return true;
+            if (b[0] == 192 && b[1] == 168) return true;
+        }
+        return false;
+    }
+
+    public static async Task<string> ResolveCountryCodeByHostAsync(string address)
+    {
+        if (string.IsNullOrWhiteSpace(address)) return "";
+
+        try
+        {
+            IPAddress? targetIp;
+            if (!IPAddress.TryParse(address, out targetIp))
+            {
+                var ips = await Dns.GetHostAddressesAsync(address).WaitAsync(TimeSpan.FromSeconds(3));
+                targetIp = ips.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork) ?? ips.FirstOrDefault();
+            }
+
+            if (targetIp == null || IsPrivateOrInvalidIp(targetIp)) return "";
+
+            string ipKey = targetIp.ToString();
+            if (_geoIpCache.TryGetValue(ipKey, out var cachedCode)) return cachedCode;
+
+            string resolved = await _geoIpTasks.GetOrAdd(ipKey, async key =>
+            {
+                await _geoIpSemaphore.WaitAsync();
+                try
+                {
+                    if (_geoIpCache.TryGetValue(key, out var existing)) return existing;
+
+                    string code = "";
+
+                    try
+                    {
+                        string json = await _httpClient.GetStringAsync($"https://ipinfo.io/{key}/json");
+                        using var doc = JsonDocument.Parse(json);
+                        if (doc.RootElement.TryGetProperty("country", out var cc))
+                            code = NormalizeCountryCode(cc.GetString() ?? "");
+                    }
+                    catch { }
+
+                    if (string.IsNullOrEmpty(code))
+                    {
+                        try
+                        {
+                            string json = await _httpClient.GetStringAsync($"https://ipwho.is/{key}?fields=success,country_code");
+                            using var doc = JsonDocument.Parse(json);
+                            if (doc.RootElement.TryGetProperty("success", out var ok) && ok.GetBoolean() &&
+                                doc.RootElement.TryGetProperty("country_code", out var cc))
+                                code = NormalizeCountryCode(cc.GetString() ?? "");
+                        }
+                        catch { }
+                    }
+
+                    if (string.IsNullOrEmpty(code))
+                    {
+                        try
+                        {
+                            string json = await _httpClient.GetStringAsync($"http://ip-api.com/json/{key}?fields=status,countryCode");
+                            using var doc = JsonDocument.Parse(json);
+                            if (doc.RootElement.TryGetProperty("status", out var status) &&
+                                status.GetString() == "success" &&
+                                doc.RootElement.TryGetProperty("countryCode", out var cc))
+                                code = NormalizeCountryCode(cc.GetString() ?? "");
+                        }
+                        catch { }
+                    }
+
+                    if (!string.IsNullOrEmpty(code))
+                    {
+                        _geoIpCache[key] = code;
+                        return code;
+                    }
+                    return "";
+                }
+                catch
+                {
+                    return "";
+                }
+                finally
+                {
+                    _geoIpSemaphore.Release();
+                    _geoIpTasks.TryRemove(key, out _);
+                }
+            });
+
+            return resolved;
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    public static void ClearDownloadState()
+    {
+        _downloadTasks.Clear();
+    }
+}
+
 public static class PingManager
 {
     private static readonly ConcurrentDictionary<string, Task<long>> _tasks = new();
@@ -78,11 +995,96 @@ public static class PingManager
     public static void Clear() => _tasks.Clear();
 }
 
-public class LanguageItem
+public class Subscription : INotifyPropertyChanged
 {
-    public required string Name { get; init; }
-    public required string Code { get; init; }
-    public override string ToString() => Name;
+    public string Id { get; set; } = Guid.NewGuid().ToString();
+    public string Name { get; set; } = "";
+    public string Url { get; set; } = "";
+    public DateTime? LastUpdated { get; set; }
+    public long UploadBytes { get; set; }
+    public long DownloadBytes { get; set; }
+    public long TotalBytes { get; set; }
+    public DateTime? ExpireDate { get; set; }
+    public bool IsExpanded { get; set; } = true;
+
+    [JsonIgnore]
+    public ObservableCollection<VpnProfile> Profiles { get; } = new();
+
+    [JsonIgnore]
+    public string ExpandChevronIcon => IsExpanded ? "\xE70E" : "\xE76C";
+
+    [JsonIgnore]
+    public double ChevronAngle => IsExpanded ? 90.0 : 0.0;
+
+    [JsonIgnore]
+    public double ExpandedOpacity => IsExpanded ? 1.0 : 0.0;
+
+    [JsonIgnore]
+    public double ExpandedScaleY => IsExpanded ? 1.0 : 0.0;
+
+    [JsonIgnore]
+    public Visibility ExpandedVisibility => IsExpanded ? Visibility.Visible : Visibility.Collapsed;
+
+    [JsonIgnore]
+    public string TrafficText
+    {
+        get
+        {
+            if (TotalBytes > 0)
+                return $"{FormatBytes(UploadBytes + DownloadBytes)} / {FormatBytes(TotalBytes)}";
+            if (UploadBytes + DownloadBytes > 0)
+                return $"{FormatBytes(UploadBytes + DownloadBytes)} / ∞";
+            return MainWindow.L("TrafficInfinite");
+        }
+    }
+
+    [JsonIgnore]
+    public string ExpireText => ExpireDate.HasValue
+        ? string.Format(MainWindow.L("ExpiresFmt"), ExpireDate.Value.ToString("dd.MM.yyyy"))
+        : "";
+
+    [JsonIgnore]
+    public string LastUpdatedText => LastUpdated.HasValue
+        ? string.Format(MainWindow.L("UpdatedFmt"), LastUpdated.Value.ToString("dd.MM.yyyy HH:mm"))
+        : MainWindow.L("NeverUpdated");
+
+    [JsonIgnore] public string TooltipPing => MainWindow.L("TooltipPing");
+    [JsonIgnore] public string TooltipUpdate => MainWindow.L("TooltipUpdate");
+    [JsonIgnore] public string TooltipDelete => MainWindow.L("TooltipDelete");
+
+    private static string FormatBytes(long bytes) => bytes switch
+    {
+        > 1073741824 => $"{bytes / 1073741824.0:F1} GB",
+        > 1048576 => $"{bytes / 1048576.0:F1} MB",
+        > 1024 => $"{bytes / 1024.0:F1} KB",
+        _ => $"{bytes} B"
+    };
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    public void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
+    public void NotifyTexts()
+    {
+        OnPropertyChanged(nameof(Name));
+        OnPropertyChanged(nameof(Url));
+        OnPropertyChanged(nameof(TrafficText));
+        OnPropertyChanged(nameof(ExpireText));
+        OnPropertyChanged(nameof(LastUpdatedText));
+        OnPropertyChanged(nameof(TooltipPing));
+        OnPropertyChanged(nameof(TooltipUpdate));
+        OnPropertyChanged(nameof(TooltipDelete));
+    }
+
+    public void NotifyAll()
+    {
+        NotifyTexts();
+        OnPropertyChanged(nameof(IsExpanded));
+        OnPropertyChanged(nameof(ExpandChevronIcon));
+        OnPropertyChanged(nameof(ChevronAngle));
+        OnPropertyChanged(nameof(ExpandedOpacity));
+        OnPropertyChanged(nameof(ExpandedScaleY));
+        OnPropertyChanged(nameof(ExpandedVisibility));
+    }
 }
 
 public class VpnProfile : INotifyPropertyChanged
@@ -94,7 +1096,7 @@ public class VpnProfile : INotifyPropertyChanged
     public string Uuid { get; set; } = "";
     public string Password { get; set; } = "";
     public string Sni { get; set; } = "";
-    public string Fp { get; set; } = "chrome";
+    public string Fp { get; set; } = "";
     public string Alpn { get; set; } = "";
     public string Pbk { get; set; } = "";
     public string Sid { get; set; } = "";
@@ -115,13 +1117,82 @@ public class VpnProfile : INotifyPropertyChanged
     public string ObfsPassword { get; set; } = "";
     public string Link { get; set; } = "";
     public bool Insecure { get; set; }
+    public string? SubscriptionId { get; set; }
+    public string? SubscriptionName { get; set; }
 
     private long _lastPingMs = -1;
     private bool _isPingError;
+    private bool _isUrlTest;
     private string _pingText = "...";
-    private SolidColorBrush _pingColor = new(Colors.Gray);
+    private SolidColorBrush _pingColor = Brushes.Gray;
+    private string? _resolvedCountryCode;
+    private bool _geoIpAttempted;
+
+    private static readonly SemaphoreSlim _pingSemaphore = new(10, 10);
+
+    [JsonIgnore] public string DisplayName => CountryFlagHelper.StripFlagEmojisAndDuplicateCode(Name);
 
     [JsonIgnore] public string DisplayAddress => $"{Address}:{Port}";
+
+    [JsonIgnore]
+    public string DisplayProtocolDetails
+    {
+        get
+        {
+            var parts = new List<string> { Protocol.ToUpperInvariant() };
+            if (!string.IsNullOrEmpty(Transport) && Transport != "tcp") parts.Add(Transport.ToUpperInvariant());
+            else if (Protocol is "vless" or "vmess") parts.Add("TCP");
+            if (!string.IsNullOrEmpty(Pbk)) parts.Add("REALITY");
+            else if (Security is "tls" || Port == 443) parts.Add("TLS");
+            return string.Join(" / ", parts);
+        }
+    }
+
+    [JsonIgnore]
+    public string CountryCode
+    {
+        get
+        {
+            string detected = CountryFlagHelper.DetectCountryCode(Name, Address);
+            if (!string.IsNullOrEmpty(detected)) return detected;
+            return _resolvedCountryCode ?? "";
+        }
+    }
+
+    [JsonIgnore]
+    public string FlagEmoji => CountryFlagHelper.CountryCodeToEmoji(CountryCode);
+
+    [JsonIgnore]
+    public BitmapImage? FlagImage
+    {
+        get
+        {
+            string code = CountryCode;
+            if (string.IsNullOrEmpty(code))
+            {
+                TriggerGeoIpResolve();
+                return null;
+            }
+            return CountryFlagHelper.GetFlagImage(code, this);
+        }
+    }
+
+    [JsonIgnore]
+    public Visibility FlagEmojiVisibility => FlagImage == null ? Visibility.Visible : Visibility.Collapsed;
+
+    [JsonIgnore]
+    public Visibility FlagFallbackVisibility => FlagImage == null ? Visibility.Visible : Visibility.Collapsed;
+
+    [JsonIgnore]
+    public bool IsActiveProfile => MainWindow.ActiveProfile == this;
+
+    [JsonIgnore]
+    public Visibility ActiveIndicatorVisibility => MainWindow.ActiveProfile == this ? Visibility.Visible : Visibility.Collapsed;
+
+    [JsonIgnore]
+    public Brush SubItemBackground => MainWindow.ActiveProfile == this
+        ? (Application.Current?.MainWindow?.TryFindResource("HoverColor") as Brush ?? new SolidColorBrush(Color.FromRgb(74, 68, 88)))
+        : System.Windows.Media.Brushes.Transparent;
 
     [JsonIgnore]
     public string PingText
@@ -138,21 +1209,73 @@ public class VpnProfile : INotifyPropertyChanged
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
-    protected void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    public void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
+    private void TriggerGeoIpResolve()
+    {
+        if (_geoIpAttempted || string.IsNullOrWhiteSpace(Address)) return;
+        _geoIpAttempted = true;
+
+        _ = Task.Run(async () =>
+        {
+            string code = await CountryFlagHelper.ResolveCountryCodeByHostAsync(Address);
+            if (!string.IsNullOrEmpty(code))
+            {
+                _resolvedCountryCode = code;
+                CountryFlagHelper.GetFlagImage(code, this);
+                Application.Current?.Dispatcher?.InvokeAsync(NotifyVisuals);
+            }
+        });
+    }
+
+    public void ResetGeoIpRetry()
+    {
+        if (string.IsNullOrEmpty(CountryCode))
+        {
+            _geoIpAttempted = false;
+        }
+        NotifyVisuals();
+    }
+
+    public void NotifyVisuals()
+    {
+        OnPropertyChanged(nameof(DisplayName));
+        OnPropertyChanged(nameof(IsActiveProfile));
+        OnPropertyChanged(nameof(ActiveIndicatorVisibility));
+        OnPropertyChanged(nameof(SubItemBackground));
+        OnPropertyChanged(nameof(FlagImage));
+        OnPropertyChanged(nameof(FlagEmoji));
+        OnPropertyChanged(nameof(FlagEmojiVisibility));
+        OnPropertyChanged(nameof(FlagFallbackVisibility));
+        OnPropertyChanged(nameof(DisplayProtocolDetails));
+    }
 
     public void ForceUpdatePing()
     {
         PingColor = GetPingColor(_lastPingMs);
         if (_lastPingMs > 0)
-            PingText = $"{_lastPingMs} {MainWindow.GetString("Lang_PingMs")}";
+            PingText = _isUrlTest ? $"{_lastPingMs} {MainWindow.L("PingMs")} (HTTP)" : $"{_lastPingMs} {MainWindow.L("PingMs")}";
         else if (PingText != "...")
-            PingText = MainWindow.GetString(_isPingError ? "Lang_PingErr" : "Lang_PingTime");
+            PingText = _isPingError ? MainWindow.L("PingError") : MainWindow.L("PingTimeout");
+    }
+
+    public void SetUrlTestResult(long ms)
+    {
+        _lastPingMs = ms;
+        _isPingError = ms <= 0;
+        _isUrlTest = true;
+        PingColor = GetPingColor(ms);
+        PingText = ms > 0 ? $"{ms} {MainWindow.L("PingMs")} (HTTP)" : MainWindow.L("PingError");
     }
 
     private static SolidColorBrush GetPingColor(long ms)
     {
         if (ms is < 0 or > 9999)
-            return new SolidColorBrush(MainWindow.IsDarkTheme ? Color.FromRgb(248, 113, 113) : Color.FromRgb(220, 38, 38));
+        {
+            var errBrush = new SolidColorBrush(MainWindow.IsDarkTheme ? Color.FromRgb(248, 113, 113) : Color.FromRgb(220, 38, 38));
+            errBrush.Freeze();
+            return errBrush;
+        }
 
         ms = Math.Clamp(ms, 0, 600);
         double t; byte r, g, b;
@@ -167,19 +1290,62 @@ public class VpnProfile : INotifyPropertyChanged
             if (ms <= 200) { t = ms / 200.0; r = (byte)(22 + t * 180); g = (byte)(163 - t * 25); b = (byte)(4 + t * 0); }
             else { t = (ms - 200) / 400.0; r = (byte)(202 + t * 18); g = (byte)(138 - t * 100); b = (byte)(4 + t * 34); }
         }
-        return new SolidColorBrush(Color.FromRgb(r, g, b));
+        var brush = new SolidColorBrush(Color.FromRgb(r, g, b));
+        brush.Freeze();
+        return brush;
     }
 
     private void UpdatePing(long ms, string text, bool isError = false)
     {
         _lastPingMs = ms;
         _isPingError = isError;
+        _isUrlTest = false;
         PingText = text;
         PingColor = GetPingColor(ms);
     }
 
-    public async Task CheckPingAsync()
+    private async Task<long> MeasureLatencyAsync(IPAddress targetIp, int port)
     {
+        long bestMs = long.MaxValue;
+
+        try
+        {
+            using var ping = new Ping();
+            for (int i = 0; i < 2; i++)
+            {
+                try
+                {
+                    var reply = await ping.SendPingAsync(targetIp, 2000);
+                    if (reply.Status == IPStatus.Success) bestMs = Math.Min(bestMs, reply.RoundtripTime);
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        if (bestMs != long.MaxValue) return Math.Max(1, bestMs);
+
+        if (MainWindow.IsVpnRunning && MainWindow.ActiveProfile != this) return -1;
+
+        for (int i = 0; i < 2; i++)
+        {
+            try
+            {
+                using var tcp = new TcpClient(targetIp.AddressFamily) { NoDelay = true };
+                var sw = Stopwatch.StartNew();
+                await tcp.ConnectAsync(targetIp, port).WaitAsync(TimeSpan.FromSeconds(2));
+                sw.Stop();
+                bestMs = Math.Min(bestMs, sw.ElapsedMilliseconds);
+            }
+            catch { }
+        }
+
+        return bestMs != long.MaxValue ? Math.Max(1, bestMs) : -1;
+    }
+
+    public async Task CheckPingAsync(bool bypassCache = false)
+    {
+        await _pingSemaphore.WaitAsync();
         try
         {
             var host = Address;
@@ -191,64 +1357,41 @@ public class VpnProfile : INotifyPropertyChanged
                 port = uri.Port > 0 ? uri.Port : 443;
             }
 
-            if (string.IsNullOrEmpty(host)) { UpdatePing(-1, MainWindow.GetString("Lang_PingErr"), true); return; }
+            if (string.IsNullOrEmpty(host)) { UpdatePing(-1, MainWindow.L("PingError"), true); return; }
 
             if (!IPAddress.TryParse(host, out var targetIp))
             {
-                var ips = await Dns.GetHostAddressesAsync(host).WaitAsync(TimeSpan.FromSeconds(2));
-                targetIp = ips.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork) ?? ips[0];
+                var ips = await Dns.GetHostAddressesAsync(host).WaitAsync(TimeSpan.FromSeconds(3));
+                targetIp = ips.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork) ?? ips.FirstOrDefault();
             }
 
-            string cacheKey = $"{targetIp}:{port}_{(MainWindow.IsVpnRunning ? "active" : "inactive")}";
-            long ms = await PingManager.GetPingTask(cacheKey, async () =>
+            if (targetIp == null || targetIp.Equals(IPAddress.Any) || targetIp.Equals(IPAddress.IPv6Any))
             {
-                long bestMs = long.MaxValue;
+                UpdatePing(-1, MainWindow.L("PingError"), true);
+                return;
+            }
 
-                try
-                {
-                    using var ping = new Ping();
-                    for (int i = 0; i < 2; i++)
-                    {
-                        try
-                        {
-                            var reply = await ping.SendPingAsync(targetIp, 2000);
-                            if (reply.Status == IPStatus.Success) bestMs = Math.Min(bestMs, reply.RoundtripTime);
-                        }
-                        catch { }
-                    }
-                }
-                catch { }
+            string protocolFamily = Protocol is "hysteria" or "hysteria2" or "tuic" or "wireguard" ? "udp" : "tcp";
+            string cacheKey = $"{targetIp}:{port}:{protocolFamily}_{(MainWindow.IsVpnRunning ? "active" : "inactive")}";
 
-                if (bestMs != long.MaxValue && bestMs > 0) return bestMs;
-
-                if (MainWindow.IsVpnRunning && MainWindow.ActiveProfile != this) return -1;
-
-                for (int i = 0; i < 2; i++)
-                {
-                    try
-                    {
-                        using var tcp = new TcpClient(targetIp.AddressFamily) { NoDelay = true };
-                        var sw = Stopwatch.StartNew();
-                        await tcp.ConnectAsync(targetIp, port).WaitAsync(TimeSpan.FromSeconds(2));
-                        sw.Stop();
-                        bestMs = Math.Min(bestMs, sw.ElapsedMilliseconds);
-                    }
-                    catch { }
-                }
-
-                return bestMs != long.MaxValue ? bestMs : -1;
-            });
+            long ms = bypassCache
+                ? await MeasureLatencyAsync(targetIp, port)
+                : await PingManager.GetPingTask(cacheKey, () => MeasureLatencyAsync(targetIp, port));
 
             if (ms > 0)
             {
                 ms = Math.Max(1, ms + Random.Shared.Next(-1, 2));
-                UpdatePing(ms, $"{ms} {MainWindow.GetString("Lang_PingMs")}");
+                UpdatePing(ms, $"{ms} {MainWindow.L("PingMs")}");
             }
-            else UpdatePing(-1, MainWindow.GetString("Lang_PingTime"));
+            else UpdatePing(-1, MainWindow.L("PingTimeout"));
         }
         catch
         {
-            UpdatePing(-1, MainWindow.GetString("Lang_PingErr"), true);
+            UpdatePing(-1, MainWindow.L("PingError"), true);
+        }
+        finally
+        {
+            _pingSemaphore.Release();
         }
     }
 }
@@ -256,23 +1399,31 @@ public class VpnProfile : INotifyPropertyChanged
 public class AppSettings
 {
     public List<VpnProfile> Profiles { get; set; } = new List<VpnProfile>();
+    public List<Subscription> Subscriptions { get; set; } = new List<Subscription>();
+    public string Hwid { get; set; } = "";
+    public string Language { get; set; } = "";
     public int SelectedProfileIndex { get; set; } = -1;
     public string Mode { get; set; } = "TUN";
-    public string Theme { get; set; } = "Dark";
-    public string Language { get; set; } = "";
+    public string Theme { get; set; } = "System";
     public string RemoteDns { get; set; } = "8.8.8.8";
+    public string DirectDns { get; set; } = "77.88.8.8";
     public bool AutoStart { get; set; }
     public bool AutoConnect { get; set; }
     public bool StartMinimized { get; set; }
+    public bool MinimizeToTray { get; set; } = true;
+    public bool AutoUpdateSubscriptions { get; set; } = true;
     public bool HasShownTrayNotification { get; set; }
     public bool EnableVisualEffects { get; set; }
     public bool DisableAnimations { get; set; }
     public bool UseCustomConfig { get; set; }
+    public bool BypassRuDomains { get; set; }
     public string RouteMode { get; set; } = "Bypass";
     public List<string> RoutingDomains { get; set; } = new List<string>();
     public List<string> RoutingApps { get; set; } = new List<string>();
     public int ProxyPort { get; set; } = 2080;
     public bool AllowLan { get; set; }
+    public bool StrictRoute { get; set; } = true;
+    public bool EnableIpv6 { get; set; }
     public string LogLevel { get; set; } = "info";
     public string TunStack { get; set; } = "system";
 }
@@ -282,32 +1433,42 @@ public partial class MainWindow : Window
     public static bool IsVpnRunning;
     public static VpnProfile? ActiveProfile;
     public static bool IsDarkTheme = true;
+    public static string CurrentLanguage = "ru";
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
 
     private Process? _singboxProcess;
     private bool _isRunning;
-    private readonly string _baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
+    private readonly string _exeDirectory = AppDomain.CurrentDomain.BaseDirectory;
     private AppSettings _currentSettings = new();
     private bool _isUpdatingSettings;
+    private bool _isUpdatingRouting;
+    private bool _lastAppliedAutoStart;
+    private string _currentTunInterfaceName = "NeonV";
+    private readonly HashSet<string> _blockedTunNames = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly ObservableCollection<VpnProfile> _profiles = new();
+    private readonly ObservableCollection<VpnProfile> _standaloneProfiles = new();
+    private readonly ObservableCollection<Subscription> _subscriptions = new();
     public ObservableCollection<string> RoutingDomainsList { get; set; } = new();
     public ObservableCollection<string> RoutingAppsList { get; set; } = new();
 
-    private readonly DispatcherTimer _pingTimer;
-    private readonly DispatcherTimer _uptimeTimer;
-    private readonly DispatcherTimer _logTimer;
+    private DispatcherTimer? _pingTimer;
+    private DispatcherTimer? _uptimeTimer;
+    private DispatcherTimer? _logTimer;
     private DateTime _connectionStartTime;
 
     private readonly Dictionary<string, string> _manualInputValues = new(StringComparer.OrdinalIgnoreCase);
     private VpnProfile? _editingProfile;
     private string _originalIp = "";
     private string _currentQrLink = "";
+    private string _lastLocationCountryCode = "";
+    private string? _lastLocationApiName;
 
     private Forms.NotifyIcon? _notifyIcon;
     private Forms.ToolStripMenuItem? _trayNavMainItem;
+    private Forms.ToolStripMenuItem? _trayNavSubscriptionsItem;
     private Forms.ToolStripMenuItem? _trayNavSettingsItem;
     private Forms.ToolStripMenuItem? _trayNavLogsItem;
     private Forms.ToolStripMenuItem? _trayModeItem;
@@ -317,540 +1478,1653 @@ public partial class MainWindow : Window
 
     private readonly Queue<string> _logBuffer = new();
     private readonly object _logLock = new();
+    private string _lastCoreError = "";
 
     private long _lastBytesReceived;
     private long _lastBytesSent;
+    private CancellationTokenSource? _saveSettingsCts;
+    private CancellationTokenSource? _notificationCts;
+    private CancellationTokenSource? _locationCts;
+    private readonly SemaphoreSlim _vpnStateSemaphore = new(1, 1);
+    private Window? _fullScreenOverlay;
 
-    private static readonly Dictionary<string, Dictionary<string, string>> Locales = new()
+    private static readonly Dictionary<string, Dictionary<string, string>> _translations = new()
     {
         ["ru"] = new()
         {
-            {"Lang_Protocol", "Протокол"}, {"Lang_CtxConnect", "Подключиться (Двойной клик)"},
-            {"Lang_CtxEdit", "Редактировать профиль"}, {"Lang_CtxCopyLink", "Копировать ссылку"},
-            {"Lang_CtxMoveUp", "Переместить вверх"}, {"Lang_CtxMoveDown", "Переместить вниз"},
-            {"Lang_CtxDelete", "Удалить"}, {"Lang_NavMain", "Главная"}, {"Lang_NavSettings", "Настройки"},
-            {"Lang_NavLogs", "Логи"}, {"Lang_Mode", "Режим работы:"}, {"Lang_AddProfile", "Добавить профиль"},
-            {"Lang_RefreshPing", "Обновить пинг"}, {"Lang_EmptyTitle", "Нет добавленных профилей"},
-            {"Lang_EmptyDesc", "Нажмите «Добавить профиль» для начала работы"}, {"Lang_SettingsTitle", "Настройки"},
-            {"Lang_StartupWork", "Запуск и работа"}, {"Lang_AutoStart", "Запускать вместе с Windows"},
-            {"Lang_AutoConnectVpn", "Автоматически подключать VPN при запуске"},
-            {"Lang_AutoConnectProxy", "Автоматически подключать Proxy при запуске"},
-            {"Lang_StartMinimized", "Запускать свернутым в трей"},
-            {"Lang_CustomConfig", "Использовать собственный config.json (без перезаписи)"},
-            {"Lang_Appearance", "Внешний вид"}, {"Lang_Language", "Язык интерфейса"}, {"Lang_Theme", "Тема оформления"},
-            {"Lang_ThemeDark", "Темная (Dark)"}, {"Lang_ThemeLight", "Светлая (Light)"},
-            {"Lang_VisualEffects", "Включить визуальные эффекты"}, {"Lang_DisableAnim", "Отключить анимации переходов"},
-            {"Lang_NetRouting", "Сеть и Маршрутизация"}, {"Lang_RemoteDns", "Удаленный DNS (Remote)"},
-            {"Lang_ConfigureRoutes", "Настроить исключения (Маршруты)"}, {"Lang_AdvancedSettings", "Продвинутые настройки"},
-            {"Lang_ProxyPort", "Порт локального прокси"}, {"Lang_AllowLan", "Разрешить подключения по локальной сети (LAN)"},
-            {"Lang_AllowLanHint", "Позволяет другим устройствам в вашей Wi-Fi сети подключаться к этому прокси."},
-            {"Lang_TunStack", "Сетевой стек TUN"},
-            {"Lang_CoreLogs", "Логи ядра"}, {"Lang_LogLevel", "Уровень: "}, {"Lang_AutoScroll", "Автопрокрутка"},
-            {"Lang_Copy", "Скопировать"}, {"Lang_Clear", "Очистить"},
-            {"Lang_AddProfileTitle", "Добавление профиля"}, {"Lang_PasteClipboard", "Вставить из буфера обмена"},
-            {"Lang_OrManual", "Или добавить вручную:"}, {"Lang_Cancel", "Отмена"}, {"Lang_Save", "Сохранить"},
-            {"Lang_RoutingTitle", "Исключения и правила"}, {"Lang_RoutingMode", "Режим исключений:"},
-            {"Lang_RouteBypass", "Включить для всех, КРОМЕ..."}, {"Lang_RouteOnly", "Включить ТОЛЬКО ДЛЯ..."},
-            {"Lang_DomainsDesc", "Сайты и домены (например: google.com)"}, {"Lang_Add", "Добавить"},
-            {"Lang_AppsDesc", "Приложения (например: telegram.exe)"}, {"Lang_Done", "Готово"},
-            {"Lang_QRTitle", "QR-Код профиля"}, {"Lang_CopyLink", "Скопировать ссылку"},
-            {"Lang_SearchPlaceholder", "Поиск профилей..."}, {"Lang_BtnEnableVpn", "ВКЛЮЧИТЬ VPN"},
-            {"Lang_BtnDisableVpn", "ВЫКЛЮЧИТЬ VPN"}, {"Lang_BtnEnableProxy", "ВКЛЮЧИТЬ PROXY"},
-            {"Lang_BtnDisableProxy", "ВЫКЛЮЧИТЬ PROXY"},
-            {"Lang_ErrInvalidAddress", "Укажите корректный адрес сервера"}, {"Lang_ErrInvalidPort", "Укажите корректный порт (1-65535)"},
-            {"Lang_ErrSelectProfile", "Сначала выберите профиль из списка!"}, {"Lang_ErrWintun", "Ошибка: Файл wintun.dll не найден!"},
-            {"Lang_ErrCrash", "Ядро Sing-box завершило работу с ошибкой. Проверьте логи."},
-            {"Lang_MsgCopied", "Скопировано в буфер обмена"}, {"Lang_MsgImportOk", "Профиль успешно импортирован"},
-            {"Lang_ErrImport", "Ошибка: в буфере нет профилей или они неверны"},
-            {"Lang_LocUnknown", "Неизвестно"}, {"Lang_TrayRunning", "Приложение работает в фоновом режиме."},
-            {"Lang_TrayUI", "Открыть интерфейс"}, {"Lang_TrayExit", "Выход"},
-            {"Lang_PingErr", "Ошибка"}, {"Lang_PingTime", "Таймаут"}, {"Lang_PingMs", "мс"},
-            {"Lang_FldName", "Название профиля"}, {"Lang_FldAddress", "Адрес (IP или домен)"},
-            {"Lang_FldPort", "Порт"}, {"Lang_FldPassword", "Пароль (Password)"},
-            {"Lang_FldUuid", "UUID / Имя пользователя"}, {"Lang_FldSni", "SNI"},
-            {"Lang_FldFp", "Fingerprint (Отпечаток)"}, {"Lang_FldInsecure", "Игнорировать ошибки TLS"},
-            {"Lang_FldFlow", "Flow"}, {"Lang_FldPbk", "Reality PBK"}, {"Lang_FldSid", "Reality SID"},
-            {"Lang_FldTransport", "Transport (tcp, ws...)"}, {"Lang_FldPath", "Path (Путь)"},
-            {"Lang_FldHost", "Host"}, {"Lang_FldSecurity", "Security"}, {"Lang_FldAlterId", "AlterID"},
-            {"Lang_FldMethod", "Метод шифрования"}, {"Lang_FldPubKey", "Public Key (Публичный)"},
-            {"Lang_FldPrivKey", "Private Key (Приватный)"}, {"Lang_FldLocalAddr", "Local Address (Локальный)"},
-            {"Lang_FldMtu", "MTU"}, {"Lang_FldAlpn", "ALPN"}, {"Lang_FldUpMbps", "Up Mbps (Отдача)"},
-            {"Lang_FldDownMbps", "Down Mbps (Загрузка)"}, {"Lang_FldObfs", "Тип Obfs"}, {"Lang_FldObfsPass", "Пароль Obfs"},
-            {"Lang_MsgRoutesChanged", "Маршруты изменены, переподключение..."},
-            {"Lang_MsgLogLevelChanged", "Уровень логов изменен, переподключение..."},
-            {"Lang_ErrQrTooLong", "Генерация QR-кода невозможна: превышена длина ссылки"},
-            {"Lang_ErrQrGen", "Произошла ошибка при генерации QR-кода"}
+            ["NavMain"] = "Главная",
+            ["NavSubs"] = "Подписки",
+            ["NavSettings"] = "Настройки",
+            ["NavLogs"] = "Логи",
+            ["ModeLabel"] = "Режим работы:",
+            ["BtnAddProfile"] = "Добавить профиль",
+            ["BtnRefreshPing"] = "Обновить пинг",
+            ["SearchPlaceholder"] = "Поиск профилей...",
+            ["EmptyProfilesTitle"] = "Нет добавленных профилей",
+            ["EmptyProfilesDesc"] = "Нажмите «Добавить профиль» для начала работы",
+            ["BtnAddSub"] = "Добавить подписку",
+            ["BtnUpdateAllSubs"] = "Обновить все",
+            ["EmptySubsTitle"] = "Нет добавленных подписок",
+            ["EmptySubsDesc"] = "Нажмите «Добавить подписку» чтобы загрузить список серверов",
+            ["SettingsTitle"] = "Настройки",
+            ["GroupLaunch"] = "Запуск и работа",
+            ["AutoStart"] = "Запускать вместе с Windows",
+            ["StartMinimized"] = "Запускать свернутым в трей",
+            ["MinimizeToTray"] = "Сворачивать в трей при закрытии",
+            ["AutoUpdateSubs"] = "Автообновление подписок при запуске",
+            ["CustomConfig"] = "Использовать собственный config.json (без перезаписи)",
+            ["GroupAppearance"] = "Внешний вид",
+            ["LangLabel"] = "Язык интерфейса (Language)",
+            ["ThemeLabel"] = "Тема оформления",
+            ["ThemeSystem"] = "Системная",
+            ["ThemeDark"] = "Темная",
+            ["ThemeLight"] = "Светлая",
+            ["VisualEffects"] = "Включить визуальные эффекты",
+            ["DisableAnimations"] = "Отключить анимации переходов",
+            ["GroupNetwork"] = "Сеть и Маршрутизация",
+            ["DnsLabel"] = "Удаленный DNS (Remote)",
+            ["DirectDnsLabel"] = "Прямой DNS (Direct)",
+            ["BtnRouting"] = "Настроить исключения (Маршруты)",
+            ["GroupAdvanced"] = "Продвинутые настройки",
+            ["ProxyPortLabel"] = "Порт локального прокси",
+            ["TunStackLabel"] = "Сетевой стек TUN",
+            ["StrictRoute"] = "Строгая маршрутизация TUN (Strict Route)",
+            ["EnableIpv6"] = "Поддержка IPv6 (Dual-Stack)",
+            ["AllowLan"] = "Разрешить подключения по локальной сети (LAN)",
+            ["AllowLanDesc"] = "Позволяет другим устройствам в вашей Wi-Fi сети подключаться к этому прокси.",
+            ["LogsTitle"] = "Логи ядра",
+            ["LogLevelLabel"] = "Уровень: ",
+            ["AutoScroll"] = "Автопрокрутка",
+            ["BtnCopyLogs"] = "Скопировать",
+            ["BtnClearLogs"] = "Очистить",
+            ["ImportTitle"] = "Добавление профиля",
+            ["EditTitle"] = "Редактировать профиль",
+            ["PasteImport"] = "Вставить из буфера обмена",
+            ["OrManual"] = "Или добавить вручную:",
+            ["ProtocolLabel"] = "Протокол",
+            ["Cancel"] = "Отмена",
+            ["Save"] = "Сохранить",
+            ["AddSubTitle"] = "Добавить подписку",
+            ["SubNameLabel"] = "Название (необязательно)",
+            ["SubUrlLabel"] = "Ссылка на подписку (URL)",
+            ["Add"] = "Добавить",
+            ["RoutingTitle"] = "Исключения и правила",
+            ["BypassRu"] = "Не проксировать российские сайты (.ru, .рф)",
+            ["RouteModeLabel"] = "Режим исключений:",
+            ["RouteModeBypass"] = "Включить для всех, КРОМЕ...",
+            ["RouteModeOnly"] = "Включить ТОЛЬКО ДЛЯ...",
+            ["DomainsLabel"] = "Сайты и домены (например: google.com)",
+            ["AppsLabel"] = "Приложения (например: telegram.exe)",
+            ["Done"] = "Готово",
+            ["QRTitle"] = "QR-Код профиля",
+            ["CopyLink"] = "Скопировать ссылку",
+            ["CtxConnect"] = "Подключиться",
+            ["CtxUrlTest"] = "Тест соединения (HTTP)",
+            ["CtxEdit"] = "Редактировать профиль",
+            ["CtxCopy"] = "Копировать ссылку",
+            ["CtxUp"] = "Переместить вверх",
+            ["CtxDown"] = "Переместить вниз",
+            ["CtxDelete"] = "Удалить",
+            ["TrafficInfinite"] = "Трафик: ∞",
+            ["ExpiresFmt"] = "Истекает: {0}",
+            ["UpdatedFmt"] = "Обновлено: {0}",
+            ["NeverUpdated"] = "Еще не обновлялось",
+            ["TooltipPing"] = "Измерить пинг",
+            ["TooltipUpdate"] = "Обновить",
+            ["TooltipDelete"] = "Удалить",
+            ["PingMs"] = "мс",
+            ["PingTimeout"] = "Таймаут",
+            ["PingError"] = "Ошибка",
+            ["UnknownLocation"] = "Неизвестно",
+            ["TrayModeFmt"] = "Режим: {0}",
+            ["TrayExit"] = "Выход",
+            ["TrayConnectVpn"] = "Включить VPN",
+            ["TrayDisconnectVpn"] = "Выключить VPN",
+            ["TrayConnectProxy"] = "Включить Proxy",
+            ["TrayDisconnectProxy"] = "Выключить Proxy",
+            ["TrayBgTip"] = "Приложение работает в фоновом режиме.",
+            ["BtnConnectVpn"] = "ВКЛЮЧИТЬ VPN",
+            ["BtnDisconnectVpn"] = "ВЫКЛЮЧИТЬ VPN",
+            ["BtnConnectProxy"] = "ВКЛЮЧИТЬ PROXY",
+            ["BtnDisconnectProxy"] = "ВЫКЛЮЧИТЬ PROXY",
+            ["AutoConnectVpn"] = "Автоматически подключать VPN при запуске",
+            ["AutoConnectProxy"] = "Автоматически подключать Proxy при запуске",
+            ["FieldName"] = "Название профиля",
+            ["FieldAddress"] = "Адрес (IP или домен)",
+            ["FieldPort"] = "Порт",
+            ["FieldPassword"] = "Пароль (Password)",
+            ["FieldUuid"] = "UUID / Имя пользователя",
+            ["FieldSni"] = "SNI",
+            ["FieldFp"] = "Fingerprint (Отпечаток)",
+            ["FieldInsecure"] = "Игнорировать ошибки TLS",
+            ["FieldFlow"] = "Flow",
+            ["FieldPbk"] = "Reality PBK",
+            ["FieldSid"] = "Reality SID",
+            ["FieldTransport"] = "Transport (tcp, ws...)",
+            ["FieldPath"] = "Path (Путь)",
+            ["FieldHost"] = "Host",
+            ["FieldSecurity"] = "Security",
+            ["FieldAlterId"] = "AlterID",
+            ["FieldMethod"] = "Метод шифрования",
+            ["FieldPublicKey"] = "Public Key (Публичный)",
+            ["FieldPrivateKey"] = "Private Key (Приватный)",
+            ["FieldLocalAddress"] = "Local Address (Локальный)",
+            ["FieldMtu"] = "MTU",
+            ["FieldAlpn"] = "ALPN",
+            ["FieldUp"] = "Up Mbps (Отдача)",
+            ["FieldDown"] = "Down Mbps (Загрузка)",
+            ["FieldObfs"] = "Тип Obfs",
+            ["FieldObfsPassword"] = "Пароль Obfs",
+            ["NotifySelectProfile"] = "Сначала выберите профиль из списка!",
+            ["NotifyAdminRequired"] = "Требуются права Администратора!",
+            ["NotifyWintunMissing"] = "Ошибка: Файл wintun.dll не найден!",
+            ["NotifyCoreExited"] = "Ядро Sing-box завершило работу с ошибкой. Проверьте логи.",
+            ["NotifyCopied"] = "Скопировано в буфер обмена",
+            ["NotifyImported"] = "Профиль успешно импортирован",
+            ["NotifyImportError"] = "Ошибка: в буфере нет профилей или они неверны",
+            ["NotifyInvalidAddress"] = "Укажите корректный адрес сервера",
+            ["NotifyInvalidPort"] = "Укажите корректный порт (1-65535)",
+            ["NotifyQrTooLong"] = "Генерация QR-кода невозможна: превышена длина ссылки",
+            ["NotifyQrError"] = "Произошла ошибка при генерации QR-кода",
+            ["NotifySubInvalidUrl"] = "Укажите корректную ссылку на подписку",
+            ["NotifySubLoading"] = "Загрузка профилей подписки...",
+            ["NotifySubAllUpdating"] = "Обновление всех подписок...",
+            ["NotifySubAllUpdated"] = "Все подписки обновлены",
+            ["NotifySubDeleted"] = "Подписка удалена",
+            ["NotifySubDeviceLimit"] = "Достигнут лимит устройств для этой подписки",
+            ["NotifySubLoadErrorFmt"] = "Ошибка загрузки подписки ({0})",
+            ["NotifySubAppUnsupported"] = "Сервер отклонил запрос (App not supported). Проверьте лимит устройств.",
+            ["NotifySubNoProfiles"] = "Подписка не содержит поддерживаемых профилей",
+            ["NotifySubUpdatedCountFmt"] = "Подписка обновлена (загружено серверов: {0})",
+            ["NotifySubErrorFmt"] = "Ошибка обновления подписки: {0}",
+            ["NotifyRoutesReconnecting"] = "Маршруты изменены, переподключение...",
+            ["NotifyLogLevelReconnecting"] = "Уровень логов изменен, переподключение...",
+            ["NotifyReconnectingServer"] = "Смена сервера, переподключение...",
+            ["NotifyModeReconnecting"] = "Режим работы изменён, переподключение...",
+            ["NotifySettingsReconnecting"] = "Настройки изменены, переподключение...",
+            ["NotifyProfileUpdatedReconnecting"] = "Профиль изменён, переподключение...",
+            ["NotifyPortBusyFallbackFmt"] = "Порт {0} занят, используется порт {1}"
         },
         ["en"] = new()
         {
-            {"Lang_Protocol", "Protocol"}, {"Lang_CtxConnect", "Connect (Double Click)"},
-            {"Lang_CtxEdit", "Edit Profile"}, {"Lang_CtxCopyLink", "Copy Link"},
-            {"Lang_CtxMoveUp", "Move Up"}, {"Lang_CtxMoveDown", "Move Down"},
-            {"Lang_CtxDelete", "Delete"}, {"Lang_NavMain", "Home"}, {"Lang_NavSettings", "Settings"},
-            {"Lang_NavLogs", "Logs"}, {"Lang_Mode", "Mode:"}, {"Lang_AddProfile", "Add Profile"},
-            {"Lang_RefreshPing", "Refresh Ping"}, {"Lang_EmptyTitle", "No Profiles Found"},
-            {"Lang_EmptyDesc", "Click «Add Profile» to get started"}, {"Lang_SettingsTitle", "Settings"},
-            {"Lang_StartupWork", "Startup & Run"}, {"Lang_AutoStart", "Run at Windows startup"},
-            {"Lang_AutoConnectVpn", "Auto-connect VPN on startup"},
-            {"Lang_AutoConnectProxy", "Auto-connect Proxy on startup"}, {"Lang_StartMinimized", "Start minimized in system tray"},
-            {"Lang_CustomConfig", "Use custom config.json (no rewrite)"},
-            {"Lang_Appearance", "Appearance"}, {"Lang_Language", "Language"}, {"Lang_Theme", "Theme"},
-            {"Lang_ThemeDark", "Dark"}, {"Lang_ThemeLight", "Light"},
-            {"Lang_VisualEffects", "Enable visual effects"}, {"Lang_DisableAnim", "Disable transition animations"},
-            {"Lang_NetRouting", "Network & Routing"}, {"Lang_RemoteDns", "Remote DNS"},
-            {"Lang_ConfigureRoutes", "Configure Routing Rules"}, {"Lang_AdvancedSettings", "Advanced Settings"},
-            {"Lang_ProxyPort", "Local Proxy Port"}, {"Lang_AllowLan", "Allow connection from LAN"},
-            {"Lang_AllowLanHint", "Allows other devices in your Wi-Fi network to connect to this proxy."},
-            {"Lang_TunStack", "TUN Network Stack"},
-            {"Lang_CoreLogs", "Core Logs"}, {"Lang_LogLevel", "Level: "}, {"Lang_AutoScroll", "Auto-scroll"},
-            {"Lang_Copy", "Copy"}, {"Lang_Clear", "Clear"},
-            {"Lang_AddProfileTitle", "Add Profile"}, {"Lang_PasteClipboard", "Paste from Clipboard"},
-            {"Lang_OrManual", "Or add manually:"}, {"Lang_Cancel", "Cancel"}, {"Lang_Save", "Save"},
-            {"Lang_RoutingTitle", "Routing Rules"}, {"Lang_RoutingMode", "Rule mode:"},
-            {"Lang_RouteBypass", "Proxy everything EXCEPT..."}, {"Lang_RouteOnly", "Proxy ONLY for..."},
-            {"Lang_DomainsDesc", "Domains (e.g. google.com)"}, {"Lang_Add", "Add"},
-            {"Lang_AppsDesc", "Applications (e.g. telegram.exe)"}, {"Lang_Done", "Done"},
-            {"Lang_QRTitle", "Profile QR-Code"}, {"Lang_CopyLink", "Copy Link"},
-            {"Lang_SearchPlaceholder", "Search profiles..."}, {"Lang_BtnEnableVpn", "ENABLE VPN"},
-            {"Lang_BtnDisableVpn", "DISABLE VPN"}, {"Lang_BtnEnableProxy", "ENABLE PROXY"},
-            {"Lang_BtnDisableProxy", "DISABLE PROXY"},
-            {"Lang_ErrInvalidAddress", "Invalid server address"}, {"Lang_ErrInvalidPort", "Invalid port (1-65535)"},
-            {"Lang_ErrSelectProfile", "Select a profile first!"}, {"Lang_ErrWintun", "Error: wintun.dll not found!"},
-            {"Lang_ErrCrash", "Sing-box core crashed. Check logs."},
-            {"Lang_MsgCopied", "Copied to clipboard"}, {"Lang_MsgImportOk", "Imported successfully"},
-            {"Lang_ErrImport", "Import error: no valid links found"},
-            {"Lang_LocUnknown", "Unknown"}, {"Lang_TrayRunning", "App is running in the background."},
-            {"Lang_TrayUI", "Open UI"}, {"Lang_TrayExit", "Exit"},
-            {"Lang_PingErr", "Err"}, {"Lang_PingTime", "Time"}, {"Lang_PingMs", "ms"},
-            {"Lang_FldName", "Profile Name"}, {"Lang_FldAddress", "Address/IP"},
-            {"Lang_FldPort", "Port"}, {"Lang_FldPassword", "Password"},
-            {"Lang_FldUuid", "UUID / Username"}, {"Lang_FldSni", "SNI"},
-            {"Lang_FldFp", "Fingerprint"}, {"Lang_FldInsecure", "Insecure (Ignore TLS)"},
-            {"Lang_FldFlow", "Flow"}, {"Lang_FldPbk", "Reality PBK"}, {"Lang_FldSid", "Reality SID"},
-            {"Lang_FldTransport", "Transport"}, {"Lang_FldPath", "Path"},
-            {"Lang_FldHost", "Host"}, {"Lang_FldSecurity", "Security"}, {"Lang_FldAlterId", "AlterID"},
-            {"Lang_FldMethod", "Method"}, {"Lang_FldPubKey", "Public Key"},
-            {"Lang_FldPrivKey", "Private Key"}, {"Lang_FldLocalAddr", "Local Address"},
-            {"Lang_FldMtu", "MTU"}, {"Lang_FldAlpn", "ALPN"}, {"Lang_FldUpMbps", "Up Mbps"},
-            {"Lang_FldDownMbps", "Down Mbps"}, {"Lang_FldObfs", "Obfs Type"}, {"Lang_FldObfsPass", "Obfs Password"},
-            {"Lang_MsgRoutesChanged", "Routes changed, reconnecting..."},
-            {"Lang_MsgLogLevelChanged", "Log level changed, reconnecting..."},
-            {"Lang_ErrQrTooLong", "QR code generation failed: link is too long"},
-            {"Lang_ErrQrGen", "An error occurred while generating the QR code"}
+            ["NavMain"] = "Home",
+            ["NavSubs"] = "Subscriptions",
+            ["NavSettings"] = "Settings",
+            ["NavLogs"] = "Logs",
+            ["ModeLabel"] = "Work mode:",
+            ["BtnAddProfile"] = "Add profile",
+            ["BtnRefreshPing"] = "Refresh ping",
+            ["SearchPlaceholder"] = "Search profiles...",
+            ["EmptyProfilesTitle"] = "No added profiles",
+            ["EmptyProfilesDesc"] = "Click \"Add profile\" to get started",
+            ["BtnAddSub"] = "Add subscription",
+            ["BtnUpdateAllSubs"] = "Update all",
+            ["EmptySubsTitle"] = "No added subscriptions",
+            ["EmptySubsDesc"] = "Click \"Add subscription\" to load server list",
+            ["SettingsTitle"] = "Settings",
+            ["GroupLaunch"] = "Launch & Startup",
+            ["AutoStart"] = "Launch with Windows",
+            ["StartMinimized"] = "Start minimized to tray",
+            ["MinimizeToTray"] = "Minimize to tray on close",
+            ["AutoUpdateSubs"] = "Auto-update subscriptions on launch",
+            ["CustomConfig"] = "Use custom config.json (without overwrite)",
+            ["GroupAppearance"] = "Appearance",
+            ["LangLabel"] = "Language",
+            ["ThemeLabel"] = "Interface theme",
+            ["ThemeSystem"] = "System",
+            ["ThemeDark"] = "Dark",
+            ["ThemeLight"] = "Light",
+            ["VisualEffects"] = "Enable visual effects",
+            ["DisableAnimations"] = "Disable transition animations",
+            ["GroupNetwork"] = "Network & Routing",
+            ["DnsLabel"] = "Remote DNS",
+            ["DirectDnsLabel"] = "Direct DNS",
+            ["BtnRouting"] = "Configure routing rules",
+            ["GroupAdvanced"] = "Advanced settings",
+            ["ProxyPortLabel"] = "Local proxy port",
+            ["TunStackLabel"] = "TUN network stack",
+            ["StrictRoute"] = "TUN Strict Route",
+            ["EnableIpv6"] = "Enable IPv6 (Dual-Stack)",
+            ["AllowLan"] = "Allow LAN connections",
+            ["AllowLanDesc"] = "Allows other devices on your Wi-Fi network to connect to this proxy.",
+            ["LogsTitle"] = "Core logs",
+            ["LogLevelLabel"] = "Level: ",
+            ["AutoScroll"] = "Auto-scroll",
+            ["BtnCopyLogs"] = "Copy",
+            ["BtnClearLogs"] = "Clear",
+            ["ImportTitle"] = "Add profile",
+            ["EditTitle"] = "Edit profile",
+            ["PasteImport"] = "Paste from clipboard",
+            ["OrManual"] = "Or add manually:",
+            ["ProtocolLabel"] = "Protocol",
+            ["Cancel"] = "Cancel",
+            ["Save"] = "Save",
+            ["AddSubTitle"] = "Add subscription",
+            ["SubNameLabel"] = "Name (optional)",
+            ["SubUrlLabel"] = "Subscription URL",
+            ["Add"] = "Add",
+            ["RoutingTitle"] = "Routing & Rules",
+            ["BypassRu"] = "Bypass Russian websites (.ru, .рф)",
+            ["RouteModeLabel"] = "Routing mode:",
+            ["RouteModeBypass"] = "Enable for all EXCEPT...",
+            ["RouteModeOnly"] = "Enable ONLY FOR...",
+            ["DomainsLabel"] = "Sites and domains (e.g. google.com)",
+            ["AppsLabel"] = "Applications (e.g. telegram.exe)",
+            ["Done"] = "Done",
+            ["QRTitle"] = "Profile QR Code",
+            ["CopyLink"] = "Copy link",
+            ["CtxConnect"] = "Connect",
+            ["CtxUrlTest"] = "Connection test (HTTP)",
+            ["CtxEdit"] = "Edit profile",
+            ["CtxCopy"] = "Copy link",
+            ["CtxUp"] = "Move up",
+            ["CtxDown"] = "Move down",
+            ["CtxDelete"] = "Delete",
+            ["TrafficInfinite"] = "Traffic: ∞",
+            ["ExpiresFmt"] = "Expires: {0}",
+            ["UpdatedFmt"] = "Updated: {0}",
+            ["NeverUpdated"] = "Not updated yet",
+            ["TooltipPing"] = "Measure ping",
+            ["TooltipUpdate"] = "Update",
+            ["TooltipDelete"] = "Delete",
+            ["PingMs"] = "ms",
+            ["PingTimeout"] = "Timeout",
+            ["PingError"] = "Error",
+            ["UnknownLocation"] = "Unknown",
+            ["TrayModeFmt"] = "Mode: {0}",
+            ["TrayExit"] = "Exit",
+            ["TrayConnectVpn"] = "Connect VPN",
+            ["TrayDisconnectVpn"] = "Disconnect VPN",
+            ["TrayConnectProxy"] = "Connect Proxy",
+            ["TrayDisconnectProxy"] = "Disconnect Proxy",
+            ["TrayBgTip"] = "Application is running in the background.",
+            ["BtnConnectVpn"] = "CONNECT VPN",
+            ["BtnDisconnectVpn"] = "DISCONNECT VPN",
+            ["BtnConnectProxy"] = "CONNECT PROXY",
+            ["BtnDisconnectProxy"] = "DISCONNECT PROXY",
+            ["AutoConnectVpn"] = "Automatically connect VPN on launch",
+            ["AutoConnectProxy"] = "Automatically connect Proxy on launch",
+            ["FieldName"] = "Profile name",
+            ["FieldAddress"] = "Address (IP or domain)",
+            ["FieldPort"] = "Port",
+            ["FieldPassword"] = "Password",
+            ["FieldUuid"] = "UUID / Username",
+            ["FieldSni"] = "SNI",
+            ["FieldFp"] = "Fingerprint",
+            ["FieldInsecure"] = "Ignore TLS errors",
+            ["FieldFlow"] = "Flow",
+            ["FieldPbk"] = "Reality PBK",
+            ["FieldSid"] = "Reality SID",
+            ["FieldTransport"] = "Transport (tcp, ws...)",
+            ["FieldPath"] = "Path",
+            ["FieldHost"] = "Host",
+            ["FieldSecurity"] = "Security",
+            ["FieldAlterId"] = "AlterID",
+            ["FieldMethod"] = "Encryption method",
+            ["FieldPublicKey"] = "Public Key",
+            ["FieldPrivateKey"] = "Private Key",
+            ["FieldLocalAddress"] = "Local Address",
+            ["FieldMtu"] = "MTU",
+            ["FieldAlpn"] = "ALPN",
+            ["FieldUp"] = "Up Mbps",
+            ["FieldDown"] = "Down Mbps",
+            ["FieldObfs"] = "Obfs type",
+            ["FieldObfsPassword"] = "Obfs password",
+            ["NotifySelectProfile"] = "Please select a profile first!",
+            ["NotifyAdminRequired"] = "Administrator privileges required!",
+            ["NotifyWintunMissing"] = "Error: wintun.dll not found!",
+            ["NotifyCoreExited"] = "Sing-box core exited with an error. Check logs.",
+            ["NotifyCopied"] = "Copied to clipboard",
+            ["NotifyImported"] = "Profile imported successfully",
+            ["NotifyImportError"] = "Error: no valid profiles in clipboard",
+            ["NotifyInvalidAddress"] = "Enter a valid server address",
+            ["NotifyInvalidPort"] = "Enter a valid port (1-65535)",
+            ["NotifyQrTooLong"] = "Cannot generate QR code: link is too long",
+            ["NotifyQrError"] = "Error generating QR code",
+            ["NotifySubInvalidUrl"] = "Enter a valid subscription URL",
+            ["NotifySubLoading"] = "Loading subscription profiles...",
+            ["NotifySubAllUpdating"] = "Updating all subscriptions...",
+            ["NotifySubAllUpdated"] = "All subscriptions updated",
+            ["NotifySubDeleted"] = "Subscription deleted",
+            ["NotifySubDeviceLimit"] = "Device limit reached for this subscription",
+            ["NotifySubLoadErrorFmt"] = "Failed to load subscription ({0})",
+            ["NotifySubAppUnsupported"] = "Server rejected request (App not supported). Check device limit.",
+            ["NotifySubNoProfiles"] = "Subscription contains no supported profiles",
+            ["NotifySubUpdatedCountFmt"] = "Subscription updated (servers loaded: {0})",
+            ["NotifySubErrorFmt"] = "Subscription update error: {0}",
+            ["NotifyRoutesReconnecting"] = "Routes changed, reconnecting...",
+            ["NotifyLogLevelReconnecting"] = "Log level changed, reconnecting...",
+            ["NotifyReconnectingServer"] = "Server changed, reconnecting...",
+            ["NotifyModeReconnecting"] = "Work mode changed, reconnecting...",
+            ["NotifySettingsReconnecting"] = "Settings changed, reconnecting...",
+            ["NotifyProfileUpdatedReconnecting"] = "Profile updated, reconnecting...",
+            ["NotifyPortBusyFallbackFmt"] = "Port {0} is busy, using port {1}"
         },
         ["uk"] = new()
         {
-            {"Lang_Protocol", "Протокол"}, {"Lang_CtxConnect", "Підключитися"},
-            {"Lang_CtxEdit", "Редагувати профіль"}, {"Lang_CtxCopyLink", "Копіювати посилання"},
-            {"Lang_CtxMoveUp", "Вгору"}, {"Lang_CtxMoveDown", "Вниз"},
-            {"Lang_CtxDelete", "Видалити"}, {"Lang_NavMain", "Головна"}, {"Lang_NavSettings", "Налаштування"},
-            {"Lang_NavLogs", "Логи"}, {"Lang_Mode", "Режим:"}, {"Lang_AddProfile", "Додати профіль"},
-            {"Lang_RefreshPing", "Оновити пінг"}, {"Lang_EmptyTitle", "Профілі відсутні"},
-            {"Lang_EmptyDesc", "Натисніть «Додати профіль», щоб розпочати"}, {"Lang_SettingsTitle", "Налаштування"},
-            {"Lang_StartupWork", "Запуск та робота"}, {"Lang_AutoStart", "Запускати разом з Windows"},
-            {"Lang_AutoConnectVpn", "Автопідключення VPN"}, {"Lang_AutoConnectProxy", "Автопідключення Proxy"},
-            {"Lang_StartMinimized", "Запускати згорнутим"}, {"Lang_CustomConfig", "Власний config.json"},
-            {"Lang_Appearance", "Зовнішній вигляд"}, {"Lang_Language", "Мова"}, {"Lang_Theme", "Тема"},
-            {"Lang_ThemeDark", "Темна"}, {"Lang_ThemeLight", "Світла"},
-            {"Lang_VisualEffects", "Увімкнути візуальні ефекти"}, {"Lang_DisableAnim", "Вимкнути анімації"},
-            {"Lang_NetRouting", "Мережа та Маршрутизація"}, {"Lang_RemoteDns", "Віддалений DNS"},
-            {"Lang_ConfigureRoutes", "Налаштувати правила"}, {"Lang_AdvancedSettings", "Розширені налаштування"},
-            {"Lang_ProxyPort", "Порт проксі"}, {"Lang_AllowLan", "Дозволити LAN"},
-            {"Lang_AllowLanHint", "Дозволяє іншим пристроям у вашій Wi-Fi мережі підключатися до цього проксі."},
-            {"Lang_TunStack", "Мережевий стек TUN"},
-            {"Lang_CoreLogs", "Логи"}, {"Lang_LogLevel", "Рівень: "}, {"Lang_AutoScroll", "Автопрокрутка"},
-            {"Lang_Copy", "Скопіювати"}, {"Lang_Clear", "Очистити"},
-            {"Lang_AddProfileTitle", "Додати профіль"}, {"Lang_PasteClipboard", "Вставити з буфера"},
-            {"Lang_OrManual", "Або вручну:"}, {"Lang_Cancel", "Скасувати"}, {"Lang_Save", "Зберегти"},
-            {"Lang_RoutingTitle", "Правила маршрутизації"}, {"Lang_RoutingMode", "Режим винятків:"},
-            {"Lang_RouteBypass", "Proxy для всіх, ОКРІМ..."}, {"Lang_RouteOnly", "Proxy ТІЛЬКИ ДЛЯ..."},
-            {"Lang_DomainsDesc", "Домени"}, {"Lang_Add", "Додати"},
-            {"Lang_AppsDesc", "Додатки (напр. telegram.exe)"}, {"Lang_Done", "Готово"},
-            {"Lang_QRTitle", "QR-Код профілю"}, {"Lang_CopyLink", "Копіювати посилання"},
-            {"Lang_SearchPlaceholder", "Пошук профілів..."}, {"Lang_BtnEnableVpn", "УВІМКНУТИ VPN"},
-            {"Lang_BtnDisableVpn", "ВИМКНУТИ VPN"}, {"Lang_BtnEnableProxy", "УВІМКНУТИ PROXY"},
-            {"Lang_BtnDisableProxy", "ВИМКНУТИ PROXY"},
-            {"Lang_ErrInvalidAddress", "Невірна адреса сервера"}, {"Lang_ErrInvalidPort", "Невірний порт (1-65535)"},
-            {"Lang_ErrSelectProfile", "Спочатку виберіть профіль!"}, {"Lang_ErrWintun", "Помилка: файл wintun.dll не знайдено!"},
-            {"Lang_ErrCrash", "Ядро Sing-box завершило работу з помилкою."},
-            {"Lang_MsgCopied", "Скопійовано"}, {"Lang_MsgImportOk", "Успішно імпортовано"},
-            {"Lang_ErrImport", "Помилка імпорту"},
-            {"Lang_LocUnknown", "Невідомо"}, {"Lang_TrayRunning", "Додаток працює у фоновому режимі."},
-            {"Lang_TrayUI", "Інтерфейс"}, {"Lang_TrayExit", "Вихід"},
-            {"Lang_PingErr", "Пом"}, {"Lang_PingTime", "Таймаут"}, {"Lang_PingMs", "мс"},
-            {"Lang_FldName", "Назва профілю"}, {"Lang_FldAddress", "Адреса/IP"},
-            {"Lang_FldPort", "Порт"}, {"Lang_FldPassword", "Пароль"},
-            {"Lang_FldUuid", "UUID / Ім'я"}, {"Lang_FldSni", "SNI"},
-            {"Lang_FldFp", "Fingerprint"}, {"Lang_FldInsecure", "Ігнорувати помилки TLS"},
-            {"Lang_FldFlow", "Flow"}, {"Lang_FldPbk", "Reality PBK"}, {"Lang_FldSid", "Reality SID"},
-            {"Lang_FldTransport", "Transport"}, {"Lang_FldPath", "Path"},
-            {"Lang_FldHost", "Host"}, {"Lang_FldSecurity", "Security"}, {"Lang_FldAlterId", "AlterID"},
-            {"Lang_FldMethod", "Метод"}, {"Lang_FldPubKey", "Public Key"},
-            {"Lang_FldPrivKey", "Private Key"}, {"Lang_FldLocalAddr", "Local Address"},
-            {"Lang_FldMtu", "MTU"}, {"Lang_FldAlpn", "ALPN"}, {"Lang_FldUpMbps", "Up Mbps"},
-            {"Lang_FldDownMbps", "Down Mbps"}, {"Lang_FldObfs", "Тип Obfs"}, {"Lang_FldObfsPass", "Пароль Obfs"},
-            {"Lang_MsgRoutesChanged", "Маршруты змінено, перепідключення..."},
-            {"Lang_MsgLogLevelChanged", "Рівень логів змінено, перепідключення..."},
-            {"Lang_ErrQrTooLong", "Генерація QR-коду неможлива: перевищено довжину посилання"},
-            {"Lang_ErrQrGen", "Виникла помилка під час генерації QR-коду"}
+            ["NavMain"] = "Головна",
+            ["NavSubs"] = "Підписки",
+            ["NavSettings"] = "Налаштування",
+            ["NavLogs"] = "Логи",
+            ["ModeLabel"] = "Режим роботи:",
+            ["BtnAddProfile"] = "Додати профіль",
+            ["BtnRefreshPing"] = "Оновити пінг",
+            ["SearchPlaceholder"] = "Пошук профілів...",
+            ["EmptyProfilesTitle"] = "Немає доданих профілів",
+            ["EmptyProfilesDesc"] = "Натисніть «Додати профіль» для початку",
+            ["BtnAddSub"] = "Додати підписку",
+            ["BtnUpdateAllSubs"] = "Оновити всі",
+            ["EmptySubsTitle"] = "Немає доданих підписок",
+            ["EmptySubsDesc"] = "Натисніть «Додати підписку» для завантаження серверів",
+            ["SettingsTitle"] = "Налаштування",
+            ["GroupLaunch"] = "Запуск і робота",
+            ["AutoStart"] = "Запускати разом з Windows",
+            ["StartMinimized"] = "Запускати згорнутим у трей",
+            ["MinimizeToTray"] = "Згортати в трей при закритті",
+            ["AutoUpdateSubs"] = "Автооновлення підписок при запуску",
+            ["CustomConfig"] = "Використовувати власний config.json (без перезапису)",
+            ["GroupAppearance"] = "Зовнішній вигляд",
+            ["LangLabel"] = "Мова інтерфейсу (Language)",
+            ["ThemeLabel"] = "Тема оформлення",
+            ["ThemeSystem"] = "Системна",
+            ["ThemeDark"] = "Темна",
+            ["ThemeLight"] = "Світла",
+            ["VisualEffects"] = "Увімкнути візуальні ефекти",
+            ["DisableAnimations"] = "Вимкнути анімації переходів",
+            ["GroupNetwork"] = "Мережа та Маршрутизація",
+            ["DnsLabel"] = "Віддалений DNS (Remote)",
+            ["DirectDnsLabel"] = "Прямий DNS (Direct)",
+            ["BtnRouting"] = "Налаштувати винятки (Маршрути)",
+            ["GroupAdvanced"] = "Розширені налаштування",
+            ["ProxyPortLabel"] = "Порт локального проксі",
+            ["TunStackLabel"] = "Мережевий стек TUN",
+            ["StrictRoute"] = "Сувора маршрутизація TUN (Strict Route)",
+            ["EnableIpv6"] = "Підтримка IPv6 (Dual-Stack)",
+            ["AllowLan"] = "Дозволити підключення локальної мережі (LAN)",
+            ["AllowLanDesc"] = "Дозволяє іншим пристроям у вашій мережі підключатися до проксі.",
+            ["LogsTitle"] = "Логи ядра",
+            ["LogLevelLabel"] = "Рівень: ",
+            ["AutoScroll"] = "Автопрокрутка",
+            ["BtnCopyLogs"] = "Скопіювати",
+            ["BtnClearLogs"] = "Очистити",
+            ["ImportTitle"] = "Додавання профілю",
+            ["EditTitle"] = "Редагувати профіль",
+            ["PasteImport"] = "Вставити з буфера обміну",
+            ["OrManual"] = "Або додати вручну:",
+            ["ProtocolLabel"] = "Протокол",
+            ["Cancel"] = "Скасувати",
+            ["Save"] = "Зберегти",
+            ["AddSubTitle"] = "Додати підписку",
+            ["SubNameLabel"] = "Назва (необов'язково)",
+            ["SubUrlLabel"] = "Посилання на підписку (URL)",
+            ["Add"] = "Додати",
+            ["RoutingTitle"] = "Винятки та правила",
+            ["BypassRu"] = "Не проксіювати російські сайти (.ru, .рф)",
+            ["RouteModeLabel"] = "Режим винятків:",
+            ["RouteModeBypass"] = "Увімкнути для всіх, КРІМ...",
+            ["RouteModeOnly"] = "Увімкнути ТІЛЬКИ ДЛЯ...",
+            ["DomainsLabel"] = "Сайти та домени (наприклад: google.com)",
+            ["AppsLabel"] = "Програми (наприклад: telegram.exe)",
+            ["Done"] = "Готово",
+            ["QRTitle"] = "QR-код профілю",
+            ["CopyLink"] = "Скопіювати посилання",
+            ["CtxConnect"] = "Підключитися",
+            ["CtxUrlTest"] = "Тест з'єднання (HTTP)",
+            ["CtxEdit"] = "Редагувати профіль",
+            ["CtxCopy"] = "Копіювати посилання",
+            ["CtxUp"] = "Перемістити вгору",
+            ["CtxDown"] = "Перемістити вниз",
+            ["CtxDelete"] = "Видалити",
+            ["TrafficInfinite"] = "Трафік: ∞",
+            ["ExpiresFmt"] = "Закінчується: {0}",
+            ["UpdatedFmt"] = "Оновлено: {0}",
+            ["NeverUpdated"] = "Ще не оновлювалося",
+            ["TooltipPing"] = "Виміряти пінг",
+            ["TooltipUpdate"] = "Оновити",
+            ["TooltipDelete"] = "Видалити",
+            ["PingMs"] = "мс",
+            ["PingTimeout"] = "Тайм-аут",
+            ["PingError"] = "Помилка",
+            ["UnknownLocation"] = "Невідомо",
+            ["TrayModeFmt"] = "Режим: {0}",
+            ["TrayExit"] = "Вихід",
+            ["TrayConnectVpn"] = "Увімкнути VPN",
+            ["TrayDisconnectVpn"] = "Вимкнути VPN",
+            ["TrayConnectProxy"] = "Увімкнути Proxy",
+            ["TrayDisconnectProxy"] = "Вимкнути Proxy",
+            ["TrayBgTip"] = "Програма працює у фоновому режимі.",
+            ["BtnConnectVpn"] = "УВІМКНУТИ VPN",
+            ["BtnDisconnectVpn"] = "ВИМКНУТИ VPN",
+            ["BtnConnectProxy"] = "УВІМКНУТИ PROXY",
+            ["BtnDisconnectProxy"] = "ВИМКНУТИ PROXY",
+            ["AutoConnectVpn"] = "Автоматично підключати VPN при запуску",
+            ["AutoConnectProxy"] = "Автоматично підключати Proxy при запуску",
+            ["FieldName"] = "Назва профілю",
+            ["FieldAddress"] = "Адреса (IP або домен)",
+            ["FieldPort"] = "Порт",
+            ["FieldPassword"] = "Пароль (Password)",
+            ["FieldUuid"] = "UUID / Ім'я користувача",
+            ["FieldSni"] = "SNI",
+            ["FieldFp"] = "Fingerprint (Відбиток)",
+            ["FieldInsecure"] = "Ігнорувати помилки TLS",
+            ["FieldFlow"] = "Flow",
+            ["FieldPbk"] = "Reality PBK",
+            ["FieldSid"] = "Reality SID",
+            ["FieldTransport"] = "Transport (tcp, ws...)",
+            ["FieldPath"] = "Path (Шлях)",
+            ["FieldHost"] = "Host",
+            ["FieldSecurity"] = "Security",
+            ["FieldAlterId"] = "AlterID",
+            ["FieldMethod"] = "Метод шифрування",
+            ["FieldPublicKey"] = "Public Key (Публічний)",
+            ["FieldPrivateKey"] = "Private Key (Приватний)",
+            ["FieldLocalAddress"] = "Local Address (Локальний)",
+            ["FieldMtu"] = "MTU",
+            ["FieldAlpn"] = "ALPN",
+            ["FieldUp"] = "Up Mbps (Віддача)",
+            ["FieldDown"] = "Down Mbps (Завантаження)",
+            ["FieldObfs"] = "Тип Obfs",
+            ["FieldObfsPassword"] = "Пароль Obfs",
+            ["NotifySelectProfile"] = "Спочатку виберіть профіль зі списку!",
+            ["NotifyAdminRequired"] = "Потрібні права Адміністратора!",
+            ["NotifyWintunMissing"] = "Помилка: файл wintun.dll не знайдено!",
+            ["NotifyCoreExited"] = "Ядро Sing-box завершило роботу з помилкою. Перевірте логи.",
+            ["NotifyCopied"] = "Скопійовано до буфера обміну",
+            ["NotifyImported"] = "Профіль успішно імпортовано",
+            ["NotifyImportError"] = "Помилка: у буфері немає профілів або вони невірні",
+            ["NotifyInvalidAddress"] = "Вкажіть коректну адресу сервера",
+            ["NotifyInvalidPort"] = "Вкажіть коректний порт (1-65535)",
+            ["NotifyQrTooLong"] = "Генерація QR-коду неможлива: перевищено довжину посилання",
+            ["NotifyQrError"] = "Виникла помилка при генерації QR-коду",
+            ["NotifySubInvalidUrl"] = "Вкажіть коректне посилання на підписку",
+            ["NotifySubLoading"] = "Завантаження профілів підписки...",
+            ["NotifySubAllUpdating"] = "Оновлення всіх підписок...",
+            ["NotifySubAllUpdated"] = "Усі підписки оновлено",
+            ["NotifySubDeleted"] = "Підписку видалено",
+            ["NotifySubDeviceLimit"] = "Досягнуто ліміт пристроїв для цієї підписки",
+            ["NotifySubLoadErrorFmt"] = "Помилка завантаження підписки ({0})",
+            ["NotifySubAppUnsupported"] = "Сервер відхилив запит (App not supported). Перевірте ліміт пристроїв.",
+            ["NotifySubNoProfiles"] = "Підписка не містить підтримуваних профілів",
+            ["NotifySubUpdatedCountFmt"] = "Підписку оновлено (завантажено серверів: {0})",
+            ["NotifySubErrorFmt"] = "Помилка оновлення підписки: {0}",
+            ["NotifyRoutesReconnecting"] = "Маршрути змінено, перепідключення...",
+            ["NotifyLogLevelReconnecting"] = "Рівень логів змінено, перепідключення...",
+            ["NotifyReconnectingServer"] = "Зміна сервера, перепідключення...",
+            ["NotifyModeReconnecting"] = "Режим роботи змінено, перепідключення...",
+            ["NotifySettingsReconnecting"] = "Налаштування змінено, перепідключення...",
+            ["NotifyProfileUpdatedReconnecting"] = "Профіль змінено, перепідключення...",
+            ["NotifyPortBusyFallbackFmt"] = "Порт {0} зайнятий, використовується порт {1}"
         },
         ["de"] = new()
         {
-            {"Lang_Protocol", "Protokoll"}, {"Lang_CtxConnect", "Verbinden"},
-            {"Lang_CtxEdit", "Profil bearbeiten"}, {"Lang_CtxCopyLink", "Link kopieren"},
-            {"Lang_CtxMoveUp", "Nach oben"}, {"Lang_CtxMoveDown", "Nach unten"},
-            {"Lang_CtxDelete", "Löschen"}, {"Lang_NavMain", "Startseite"}, {"Lang_NavSettings", "Einstellung"},
-            {"Lang_NavLogs", "Protokolle"}, {"Lang_Mode", "Modus:"}, {"Lang_AddProfile", "Profil hinzufügen"},
-            {"Lang_RefreshPing", "Ping aktualisieren"}, {"Lang_EmptyTitle", "Keine Profile"},
-            {"Lang_EmptyDesc", "Klicke auf Profil hinzufügen"}, {"Lang_SettingsTitle", "Einstellungen"},
-            {"Lang_StartupWork", "Systemstart"}, {"Lang_AutoStart", "Beim Windows-Start ausführen"},
-            {"Lang_AutoConnectVpn", "VPN automatisch verbinden"}, {"Lang_AutoConnectProxy", "Proxy automatisch verbinden"},
-            {"Lang_StartMinimized", "Minimiert starten"}, {"Lang_CustomConfig", "Benutzerdefinierte config.json"},
-            {"Lang_Appearance", "Aussehen"}, {"Lang_Language", "Sprache"}, {"Lang_Theme", "Thema"},
-            {"Lang_ThemeDark", "Dunkel"}, {"Lang_ThemeLight", "Hell"},
-            {"Lang_VisualEffects", "Visuelle Effekte aktivieren"}, {"Lang_DisableAnim", "Animationen deaktivieren"},
-            {"Lang_NetRouting", "Netzwerk & Routing"}, {"Lang_RemoteDns", "Remote-DNS"},
-            {"Lang_ConfigureRoutes", "Regeln konfigurieren"}, {"Lang_AdvancedSettings", "Erweiterte Einstellungen"},
-            {"Lang_ProxyPort", "Proxy-Port"}, {"Lang_AllowLan", "LAN-Verbindungen zulassen"},
-            {"Lang_AllowLanHint", "Ermöglicht anderen Geräten in Ihrem WLAN, sich mit diesem Proxy zu verbinden."},
-            {"Lang_TunStack", "TUN-Stack"},
-            {"Lang_CoreLogs", "Logs"}, {"Lang_LogLevel", "Level: "}, {"Lang_AutoScroll", "Autoscroll"},
-            {"Lang_Copy", "Kopieren"}, {"Lang_Clear", "Löschen"},
-            {"Lang_AddProfileTitle", "Profil hinzufügen"}, {"Lang_PasteClipboard", "Aus der Zwischenablage"},
-            {"Lang_OrManual", "Oder manuell:"}, {"Lang_Cancel", "Abbrechen"}, {"Lang_Save", "Speichern"},
-            {"Lang_RoutingTitle", "Routing-Regeln"}, {"Lang_RoutingMode", "Modus:"},
-            {"Lang_RouteBypass", "Alles Proxy AUSSER..."}, {"Lang_RouteOnly", "Proxy NUR FÜR..."},
-            {"Lang_DomainsDesc", "Domains"}, {"Lang_Add", "Hinzufügen"},
-            {"Lang_AppsDesc", "Anwendungen"}, {"Lang_Done", "Fertig"},
-            {"Lang_QRTitle", "QR-Code"}, {"Lang_CopyLink", "Link kopieren"},
-            {"Lang_SearchPlaceholder", "Profile suchen..."}, {"Lang_BtnEnableVpn", "VPN AKTIVIEREN"},
-            {"Lang_BtnDisableVpn", "VPN DEAKTIVIEREN"}, {"Lang_BtnEnableProxy", "PROXY AKTIVIEREN"},
-            {"Lang_BtnDisableProxy", "PROXY DEAKTIVIEREN"},
-            {"Lang_ErrInvalidAddress", "Ungültige Adresse"}, {"Lang_ErrInvalidPort", "Ungültiger Port"},
-            {"Lang_ErrSelectProfile", "Zuerst ein Profil auswählen!"}, {"Lang_ErrWintun", "Fehler: wintun.dll nicht gefunden!"},
-            {"Lang_ErrCrash", "Sing-box abgestürzt. Logs prüfen."},
-            {"Lang_MsgCopied", "Kopiert"}, {"Lang_MsgImportOk", "Erfolgreich importiert"},
-            {"Lang_ErrImport", "Importfehler"},
-            {"Lang_LocUnknown", "Unbekannt"}, {"Lang_TrayRunning", "App läuft im Hintergrund."},
-            {"Lang_TrayUI", "UI öffnen"}, {"Lang_TrayExit", "Beenden"},
-            {"Lang_PingErr", "Fehler"}, {"Lang_PingTime", "Zeit"}, {"Lang_PingMs", "ms"},
-            {"Lang_FldName", "Profilname"}, {"Lang_FldAddress", "Adresse/IP"},
-            {"Lang_FldPort", "Port"}, {"Lang_FldPassword", "Passwort"},
-            {"Lang_FldUuid", "UUID / Name"}, {"Lang_FldSni", "SNI"},
-            {"Lang_FldFp", "Fingerprint"}, {"Lang_FldInsecure", "TLS-Fehler ignorieren"},
-            {"Lang_FldFlow", "Flow"}, {"Lang_FldPbk", "Reality PBK"}, {"Lang_FldSid", "Reality SID"},
-            {"Lang_FldTransport", "Transport"}, {"Lang_FldPath", "Pfad"},
-            {"Lang_FldHost", "Host"}, {"Lang_FldSecurity", "Sicherheit"}, {"Lang_FldAlterId", "AlterID"},
-            {"Lang_FldMethod", "Methode"}, {"Lang_FldPubKey", "Public Key"},
-            {"Lang_FldPrivKey", "Private Key"}, {"Lang_FldLocalAddr", "Lokale Adresse"},
-            {"Lang_FldMtu", "MTU"}, {"Lang_FldAlpn", "ALPN"}, {"Lang_FldUpMbps", "Up Mbps"},
-            {"Lang_FldDownMbps", "Down Mbps"}, {"Lang_FldObfs", "Obfs-Typ"}, {"Lang_FldObfsPass", "Obfs-Passwort"},
-            {"Lang_MsgRoutesChanged", "Routen geändert, neu verbinden..."},
-            {"Lang_MsgLogLevelChanged", "Loglevel geändert, neu verbinden..."},
-            {"Lang_ErrQrTooLong", "QR-Code Generierung fehlgeschlagen: Link ist zu lang"},
-            {"Lang_ErrQrGen", "Fehler beim Generieren des QR-Codes"}
+            ["NavMain"] = "Übersicht",
+            ["NavSubs"] = "Abonnements",
+            ["NavSettings"] = "Einstellungen",
+            ["NavLogs"] = "Protokolle",
+            ["ModeLabel"] = "Betriebsmodus:",
+            ["BtnAddProfile"] = "Profil hinzufügen",
+            ["BtnRefreshPing"] = "Ping aktualisieren",
+            ["SearchPlaceholder"] = "Profile suchen...",
+            ["EmptyProfilesTitle"] = "Keine Profile vorhanden",
+            ["EmptyProfilesDesc"] = "Klicken Sie auf «Profil hinzufügen» zum Starten",
+            ["BtnAddSub"] = "Abo hinzufügen",
+            ["BtnUpdateAllSubs"] = "Alle aktualisieren",
+            ["EmptySubsTitle"] = "Keine Abonnements vorhanden",
+            ["EmptySubsDesc"] = "Klicken Sie auf «Abo hinzufügen», um Server zu laden",
+            ["SettingsTitle"] = "Einstellungen",
+            ["GroupLaunch"] = "Start & Betrieb",
+            ["AutoStart"] = "Mit Windows starten",
+            ["StartMinimized"] = "Minimiert in den Tray starten",
+            ["MinimizeToTray"] = "Beim Schließen in den Tray minimieren",
+            ["AutoUpdateSubs"] = "Abonnements beim Start aktualisieren",
+            ["CustomConfig"] = "Eigene config.json nutzen",
+            ["GroupAppearance"] = "Erscheinungsbild",
+            ["LangLabel"] = "Sprache (Language)",
+            ["ThemeLabel"] = "Design",
+            ["ThemeSystem"] = "System",
+            ["ThemeDark"] = "Dunkel",
+            ["ThemeLight"] = "Hell",
+            ["VisualEffects"] = "Visuelle Effekte aktivieren",
+            ["DisableAnimations"] = "Übergangsanimationen deaktivieren",
+            ["GroupNetwork"] = "Netzwerk & Routing",
+            ["DnsLabel"] = "Remote DNS",
+            ["DirectDnsLabel"] = "Direkter DNS",
+            ["BtnRouting"] = "Routing-Regeln konfigurieren",
+            ["GroupAdvanced"] = "Erweiterte Einstellungen",
+            ["ProxyPortLabel"] = "Lokaler Proxy-Port",
+            ["TunStackLabel"] = "TUN-Netzwerkstack",
+            ["StrictRoute"] = "TUN Strict Route",
+            ["EnableIpv6"] = "IPv6 aktivieren (Dual-Stack)",
+            ["AllowLan"] = "LAN-Verbindungen zulassen",
+            ["AllowLanDesc"] = "Erlaubt anderen Geräten im WLAN-Netzwerk die Verbindung.",
+            ["LogsTitle"] = "Core-Protokolle",
+            ["LogLevelLabel"] = "Level: ",
+            ["AutoScroll"] = "Auto-Scroll",
+            ["BtnCopyLogs"] = "Kopieren",
+            ["BtnClearLogs"] = "Löschen",
+            ["ImportTitle"] = "Profil hinzufügen",
+            ["EditTitle"] = "Profil bearbeiten",
+            ["PasteImport"] = "Aus Zwischenablage einfügen",
+            ["OrManual"] = "Oder manuell hinzufügen:",
+            ["ProtocolLabel"] = "Protokoll",
+            ["Cancel"] = "Abbrechen",
+            ["Save"] = "Speichern",
+            ["AddSubTitle"] = "Abo hinzufügen",
+            ["SubNameLabel"] = "Name (optional)",
+            ["SubUrlLabel"] = "Abo-URL",
+            ["Add"] = "Hinzufügen",
+            ["RoutingTitle"] = "Routing-Regeln",
+            ["BypassRu"] = "Russische Websites umgehen (.ru, .рф)",
+            ["RouteModeLabel"] = "Ausnahmemodus:",
+            ["RouteModeBypass"] = "Aktivieren für alle AUSSER...",
+            ["RouteModeOnly"] = "NUR aktivieren FÜR...",
+            ["DomainsLabel"] = "Domains (z.B. google.com)",
+            ["AppsLabel"] = "Anwendungen (z.B. telegram.exe)",
+            ["Done"] = "Fertig",
+            ["QRTitle"] = "Profil QR-Code",
+            ["CopyLink"] = "Link kopieren",
+            ["CtxConnect"] = "Verbinden",
+            ["CtxUrlTest"] = "Verbindungstest (HTTP)",
+            ["CtxEdit"] = "Profil bearbeiten",
+            ["CtxCopy"] = "Link kopieren",
+            ["CtxUp"] = "Nach oben",
+            ["CtxDown"] = "Nach unten",
+            ["CtxDelete"] = "Löschen",
+            ["TrafficInfinite"] = "Datenverkehr: ∞",
+            ["ExpiresFmt"] = "Läuft ab: {0}",
+            ["UpdatedFmt"] = "Aktualisiert: {0}",
+            ["NeverUpdated"] = "Noch nicht aktualisiert",
+            ["TooltipPing"] = "Ping messen",
+            ["TooltipUpdate"] = "Aktualisieren",
+            ["TooltipDelete"] = "Löschen",
+            ["PingMs"] = "ms",
+            ["PingTimeout"] = "Zeitlimit",
+            ["PingError"] = "Fehler",
+            ["UnknownLocation"] = "Unbekannt",
+            ["TrayModeFmt"] = "Modus: {0}",
+            ["TrayExit"] = "Beenden",
+            ["TrayConnectVpn"] = "VPN verbinden",
+            ["TrayDisconnectVpn"] = "VPN trennen",
+            ["TrayConnectProxy"] = "Proxy verbinden",
+            ["TrayDisconnectProxy"] = "Proxy trennen",
+            ["TrayBgTip"] = "Die Anwendung läuft im Hintergrund.",
+            ["BtnConnectVpn"] = "VPN VERBINDEN",
+            ["BtnDisconnectVpn"] = "VPN TRENNEN",
+            ["BtnConnectProxy"] = "PROXY VERBINDEN",
+            ["BtnDisconnectProxy"] = "PROXY TRENNEN",
+            ["AutoConnectVpn"] = "VPN beim Start automatisch verbinden",
+            ["AutoConnectProxy"] = "Proxy beim Start automatisch verbinden",
+            ["FieldName"] = "Profilname",
+            ["FieldAddress"] = "Adresse (IP oder Domain)",
+            ["FieldPort"] = "Port",
+            ["FieldPassword"] = "Passwort",
+            ["FieldUuid"] = "UUID / Benutzername",
+            ["FieldSni"] = "SNI",
+            ["FieldFp"] = "Fingerprint",
+            ["FieldInsecure"] = "TLS-Fehler ignorieren",
+            ["FieldFlow"] = "Flow",
+            ["FieldPbk"] = "Reality PBK",
+            ["FieldSid"] = "Reality SID",
+            ["FieldTransport"] = "Transport (tcp, ws...)",
+            ["FieldPath"] = "Pfad",
+            ["FieldHost"] = "Host",
+            ["FieldSecurity"] = "Security",
+            ["FieldAlterId"] = "AlterID",
+            ["FieldMethod"] = "Verschlüsselungsmethode",
+            ["FieldPublicKey"] = "Public Key",
+            ["FieldPrivateKey"] = "Private Key",
+            ["FieldLocalAddress"] = "Lokale Adresse",
+            ["FieldMtu"] = "MTU",
+            ["FieldAlpn"] = "ALPN",
+            ["FieldUp"] = "Upload Mbps",
+            ["FieldDown"] = "Download Mbps",
+            ["FieldObfs"] = "Obfs-Typ",
+            ["FieldObfsPassword"] = "Obfs-Passwort",
+            ["NotifySelectProfile"] = "Bitte zuerst ein Profil auswählen!",
+            ["NotifyAdminRequired"] = "Administratorrechte erforderlich!",
+            ["NotifyWintunMissing"] = "Fehler: wintun.dll nicht gefunden!",
+            ["NotifyCoreExited"] = "Sing-box wurde mit einem Fehler beendet. Protokolle prüfen.",
+            ["NotifyCopied"] = "In Zwischenablage kopiert",
+            ["NotifyImported"] = "Profil erfolgreich importiert",
+            ["NotifyImportError"] = "Fehler: Keine gültigen Profile in Zwischenablage",
+            ["NotifyInvalidAddress"] = "Gültige Serveradresse eingeben",
+            ["NotifyInvalidPort"] = "Gültigen Port eingeben (1-65535)",
+            ["NotifyQrTooLong"] = "QR-Code nicht möglich: Link zu lang",
+            ["NotifyQrError"] = "Fehler beim Erstellen des QR-Codes",
+            ["NotifySubInvalidUrl"] = "Gültige Abo-URL eingeben",
+            ["NotifySubLoading"] = "Abonnement wird geladen...",
+            ["NotifySubAllUpdating"] = "Alle Abonnements werden aktualisiert...",
+            ["NotifySubAllUpdated"] = "Alle Abonnements aktualisiert",
+            ["NotifySubDeleted"] = "Abonnement gelöscht",
+            ["NotifySubDeviceLimit"] = "Gerätelimit für dieses Abo erreicht",
+            ["NotifySubLoadErrorFmt"] = "Fehler beim Laden des Abos ({0})",
+            ["NotifySubAppUnsupported"] = "Anfrage abgelehnt (App not supported). Gerätelimit prüfen.",
+            ["NotifySubNoProfiles"] = "Abonnement enthält keine unterstützten Profile",
+            ["NotifySubUpdatedCountFmt"] = "Abo aktualisiert (Server geladen: {0})",
+            ["NotifySubErrorFmt"] = "Fehler bei Abo-Aktualisierung: {0}",
+            ["NotifyRoutesReconnecting"] = "Routen geändert, verbinde neu...",
+            ["NotifyLogLevelReconnecting"] = "Protokolllevel geändert, verbinde neu...",
+            ["NotifyReconnectingServer"] = "Server gewechselt, verbinde neu...",
+            ["NotifyModeReconnecting"] = "Modus geändert, verbinde neu...",
+            ["NotifySettingsReconnecting"] = "Einstellungen geändert, verbinde neu...",
+            ["NotifyProfileUpdatedReconnecting"] = "Profil aktualisiert, verbinde neu...",
+            ["NotifyPortBusyFallbackFmt"] = "Port {0} ist belegt, verwende Port {1}"
         },
-        ["zh-Hans"] = new()
+        ["zh-CN"] = new()
         {
-            {"Lang_Protocol", "协议"}, {"Lang_CtxConnect", "连接"},
-            {"Lang_CtxEdit", "编辑配置"}, {"Lang_CtxCopyLink", "复制链接"},
-            {"Lang_CtxMoveUp", "上移"}, {"Lang_CtxMoveDown", "下移"},
-            {"Lang_CtxDelete", "删除"}, {"Lang_NavMain", "首页"}, {"Lang_NavSettings", "设置"},
-            {"Lang_NavLogs", "日志"}, {"Lang_Mode", "模式:"}, {"Lang_AddProfile", "添加配置"},
-            {"Lang_RefreshPing", "延迟测试"}, {"Lang_EmptyTitle", "没有配置"},
-            {"Lang_EmptyDesc", "点击添加配置以开始"}, {"Lang_SettingsTitle", "设置"},
-            {"Lang_StartupWork", "启动与运行"}, {"Lang_AutoStart", "开机自启"},
-            {"Lang_AutoConnectVpn", "启动时自动连接 VPN"}, {"Lang_AutoConnectProxy", "启动时自动连接 Proxy"},
-            {"Lang_StartMinimized", "静默启动到托盘"}, {"Lang_CustomConfig", "使用自定义 config.json"},
-            {"Lang_Appearance", "外观"}, {"Lang_Language", "语言"}, {"Lang_Theme", "主题"},
-            {"Lang_ThemeDark", "深色"}, {"Lang_ThemeLight", "浅色"},
-            {"Lang_VisualEffects", "开启视觉效果"}, {"Lang_DisableAnim", "关闭过渡动画"},
-            {"Lang_NetRouting", "网络与路由"}, {"Lang_RemoteDns", "远程 DNS"},
-            {"Lang_ConfigureRoutes", "配置路由规则"}, {"Lang_AdvancedSettings", "高级设置"},
-            {"Lang_ProxyPort", "本地代理端口"}, {"Lang_AllowLan", "允许局域网连接"},
-            {"Lang_AllowLanHint", "允许同一 Wi-Fi 网络中的其他设备连接到此代理。"},
-            {"Lang_TunStack", "TUN 网络栈"},
-            {"Lang_CoreLogs", "核心日志"}, {"Lang_LogLevel", "日志级别: "}, {"Lang_AutoScroll", "自动滚动"},
-            {"Lang_Copy", "复制"}, {"Lang_Clear", "清空"},
-            {"Lang_AddProfileTitle", "添加配置"}, {"Lang_PasteClipboard", "从剪贴板导入"},
-            {"Lang_OrManual", "或手动输入:"}, {"Lang_Cancel", "取消"}, {"Lang_Save", "保存"},
-            {"Lang_RoutingTitle", "路由规则"}, {"Lang_RoutingMode", "规则模式:"},
-            {"Lang_RouteBypass", "代理所有，除了..."}, {"Lang_RouteOnly", "仅代理..."},
-            {"Lang_DomainsDesc", "域名"}, {"Lang_Add", "添加"},
-            {"Lang_AppsDesc", "应用程序"}, {"Lang_Done", "完成"},
-            {"Lang_QRTitle", "配置二维码"}, {"Lang_CopyLink", "复制链接"},
-            {"Lang_SearchPlaceholder", "搜索配置..."}, {"Lang_BtnEnableVpn", "开启 VPN"},
-            {"Lang_BtnDisableVpn", "关闭 VPN"}, {"Lang_BtnEnableProxy", "开启 PROXY"},
-            {"Lang_BtnDisableProxy", "关闭 PROXY"},
-            {"Lang_ErrInvalidAddress", "无效地址"}, {"Lang_ErrInvalidPort", "无效端口"},
-            {"Lang_ErrSelectProfile", "请先选择一个配置！"}, {"Lang_ErrWintun", "错误：未找到 wintun.dll！"},
-            {"Lang_ErrCrash", "Sing-box 核心崩溃。请检查日志。"},
-            {"Lang_MsgCopied", "已复制"}, {"Lang_MsgImportOk", "导入成功"},
-            {"Lang_ErrImport", "导入错误"},
-            {"Lang_LocUnknown", "未知"}, {"Lang_TrayRunning", "应用正在后台运行。"},
-            {"Lang_TrayUI", "打开界面"}, {"Lang_TrayExit", "退出"},
-            {"Lang_PingErr", "错误"}, {"Lang_PingTime", "超时"}, {"Lang_PingMs", "毫秒"},
-            {"Lang_FldName", "配置名称"}, {"Lang_FldAddress", "地址/IP"},
-            {"Lang_FldPort", "端口"}, {"Lang_FldPassword", "密码"},
-            {"Lang_FldUuid", "UUID / 用户名"}, {"Lang_FldSni", "SNI"},
-            {"Lang_FldFp", "指纹 (Fingerprint)"}, {"Lang_FldInsecure", "忽略 TLS 证书错误"},
-            {"Lang_FldFlow", "流控 (Flow)"}, {"Lang_FldPbk", "Reality PBK"}, {"Lang_FldSid", "Reality SID"},
-            {"Lang_FldTransport", "传输方式 (Transport)"}, {"Lang_FldPath", "路径 (Path)"},
-            {"Lang_FldHost", "主机 (Host)"}, {"Lang_FldSecurity", "安全 (Security)"}, {"Lang_FldAlterId", "额外ID (AlterID)"},
-            {"Lang_FldMethod", "加密方法"}, {"Lang_FldPubKey", "公钥 (Public Key)"},
-            {"Lang_FldPrivKey", "私钥 (Private Key)"}, {"Lang_FldLocalAddr", "本地地址"},
-            {"Lang_FldMtu", "MTU"}, {"Lang_FldAlpn", "ALPN"}, {"Lang_FldUpMbps", "上传 Mbps"},
-            {"Lang_FldDownMbps", "下载 Mbps"}, {"Lang_FldObfs", "混淆类型"}, {"Lang_FldObfsPass", "混淆密码"},
-            {"Lang_MsgRoutesChanged", "路由已更改，重新连接..."},
-            {"Lang_MsgLogLevelChanged", "日志级别已更改，重新连接..."},
-            {"Lang_ErrQrTooLong", "无法生成二维码：链接过长"},
-            {"Lang_ErrQrGen", "生成二维码时发生错误"}
+            ["NavMain"] = "首页",
+            ["NavSubs"] = "订阅",
+            ["NavSettings"] = "设置",
+            ["NavLogs"] = "日志",
+            ["ModeLabel"] = "工作模式:",
+            ["BtnAddProfile"] = "添加配置",
+            ["BtnRefreshPing"] = "刷新延迟",
+            ["SearchPlaceholder"] = "搜索节点...",
+            ["EmptyProfilesTitle"] = "暂无配置",
+            ["EmptyProfilesDesc"] = "点击“添加配置”开始使用",
+            ["BtnAddSub"] = "添加订阅",
+            ["BtnUpdateAllSubs"] = "更新全部",
+            ["EmptySubsTitle"] = "暂无订阅",
+            ["EmptySubsDesc"] = "点击“添加订阅”获取节点列表",
+            ["SettingsTitle"] = "设置",
+            ["GroupLaunch"] = "常规启动",
+            ["AutoStart"] = "开机自启",
+            ["StartMinimized"] = "启动后最小化到托盘",
+            ["MinimizeToTray"] = "关闭时最小化到托盘",
+            ["AutoUpdateSubs"] = "启动时自动更新订阅",
+            ["CustomConfig"] = "使用自定义 config.json",
+            ["GroupAppearance"] = "外观",
+            ["LangLabel"] = "界面语言 (Language)",
+            ["ThemeLabel"] = "主题",
+            ["ThemeSystem"] = "跟随系统",
+            ["ThemeDark"] = "暗色",
+            ["ThemeLight"] = "亮色",
+            ["VisualEffects"] = "开启视觉特效",
+            ["DisableAnimations"] = "禁用过渡动画",
+            ["GroupNetwork"] = "网络与分流",
+            ["DnsLabel"] = "远程 DNS",
+            ["DirectDnsLabel"] = "直连 DNS (Direct)",
+            ["BtnRouting"] = "配置分流规则",
+            ["GroupAdvanced"] = "高级选项",
+            ["ProxyPortLabel"] = "本地代理端口",
+            ["TunStackLabel"] = "TUN 协议栈",
+            ["StrictRoute"] = "TUN 严格路由 (Strict Route)",
+            ["EnableIpv6"] = "启用 IPv6 (双栈)",
+            ["AllowLan"] = "允许局域网连接",
+            ["AllowLanDesc"] = "允许同一 Wi-Fi 网络下的其他设备连接代理。",
+            ["LogsTitle"] = "核心日志",
+            ["LogLevelLabel"] = "级别: ",
+            ["AutoScroll"] = "自动滚动",
+            ["BtnCopyLogs"] = "复制",
+            ["BtnClearLogs"] = "清空",
+            ["ImportTitle"] = "添加配置",
+            ["EditTitle"] = "编辑配置",
+            ["PasteImport"] = "从剪贴板导入",
+            ["OrManual"] = "或手动添加:",
+            ["ProtocolLabel"] = "协议",
+            ["Cancel"] = "取消",
+            ["Save"] = "保存",
+            ["AddSubTitle"] = "添加订阅",
+            ["SubNameLabel"] = "名称 (可选)",
+            ["SubUrlLabel"] = "订阅链接 (URL)",
+            ["Add"] = "添加",
+            ["RoutingTitle"] = "分流规则",
+            ["BypassRu"] = "不代理俄罗斯网站 (.ru, .рф)",
+            ["RouteModeLabel"] = "分流模式:",
+            ["RouteModeBypass"] = "绕过列表中的项目...",
+            ["RouteModeOnly"] = "仅代理列表中的项目...",
+            ["DomainsLabel"] = "网站与域名 (如 google.com)",
+            ["AppsLabel"] = "应用程序 (如 telegram.exe)",
+            ["Done"] = "完成",
+            ["QRTitle"] = "配置二维码",
+            ["CopyLink"] = "复制链接",
+            ["CtxConnect"] = "连接",
+            ["CtxUrlTest"] = "HTTP 延迟测试",
+            ["CtxEdit"] = "编辑配置",
+            ["CtxCopy"] = "复制链接",
+            ["CtxUp"] = "上移",
+            ["CtxDown"] = "下移",
+            ["CtxDelete"] = "删除",
+            ["TrafficInfinite"] = "流量: ∞",
+            ["ExpiresFmt"] = "到期: {0}",
+            ["UpdatedFmt"] = "已更新: {0}",
+            ["NeverUpdated"] = "尚未更新",
+            ["TooltipPing"] = "测试延迟",
+            ["TooltipUpdate"] = "更新",
+            ["TooltipDelete"] = "删除",
+            ["PingMs"] = "ms",
+            ["PingTimeout"] = "超时",
+            ["PingError"] = "错误",
+            ["UnknownLocation"] = "未知",
+            ["TrayModeFmt"] = "模式: {0}",
+            ["TrayExit"] = "退出",
+            ["TrayConnectVpn"] = "连接 VPN",
+            ["TrayDisconnectVpn"] = "断开 VPN",
+            ["TrayConnectProxy"] = "连接 Proxy",
+            ["TrayDisconnectProxy"] = "断开 Proxy",
+            ["TrayBgTip"] = "应用程序正在后台运行。",
+            ["BtnConnectVpn"] = "连接 VPN",
+            ["BtnDisconnectVpn"] = "断开 VPN",
+            ["BtnConnectProxy"] = "连接 PROXY",
+            ["BtnDisconnectProxy"] = "断开 PROXY",
+            ["AutoConnectVpn"] = "启动时自动连接 VPN",
+            ["AutoConnectProxy"] = "启动时自动连接 Proxy",
+            ["FieldName"] = "配置名称",
+            ["FieldAddress"] = "服务器地址 (IP 或域名)",
+            ["FieldPort"] = "端口",
+            ["FieldPassword"] = "密码 (Password)",
+            ["FieldUuid"] = "UUID / 用户名",
+            ["FieldSni"] = "SNI",
+            ["FieldFp"] = "Fingerprint (指纹)",
+            ["FieldInsecure"] = "跳过 TLS 证书验证",
+            ["FieldFlow"] = "Flow",
+            ["FieldPbk"] = "Reality PBK",
+            ["FieldSid"] = "Reality SID",
+            ["FieldTransport"] = "传输协议 (tcp, ws...)",
+            ["FieldPath"] = "路径 (Path)",
+            ["FieldHost"] = "伪装域名 (Host)",
+            ["FieldSecurity"] = "加密方式 (Security)",
+            ["FieldAlterId"] = "AlterID",
+            ["FieldMethod"] = "加密方法",
+            ["FieldPublicKey"] = "公钥 (Public Key)",
+            ["FieldPrivateKey"] = "私钥 (Private Key)",
+            ["FieldLocalAddress"] = "本地地址 (Local Address)",
+            ["FieldMtu"] = "MTU",
+            ["FieldAlpn"] = "ALPN",
+            ["FieldUp"] = "上行 Mbps",
+            ["FieldDown"] = "下行 Mbps",
+            ["FieldObfs"] = "混淆类型 (Obfs)",
+            ["FieldObfsPassword"] = "混淆密码",
+            ["NotifySelectProfile"] = "请先选择一个配置！",
+            ["NotifyAdminRequired"] = "需要管理员权限！",
+            ["NotifyWintunMissing"] = "错误：未找到 wintun.dll！",
+            ["NotifyCoreExited"] = "Sing-box 核心异常退出，请查看日志。",
+            ["NotifyCopied"] = "已复制到剪贴板",
+            ["NotifyImported"] = "配置导入成功",
+            ["NotifyImportError"] = "错误：剪贴板中没有有效配置",
+            ["NotifyInvalidAddress"] = "请输入有效的服务器地址",
+            ["NotifyInvalidPort"] = "请输入有效的端口 (1-65535)",
+            ["NotifyQrTooLong"] = "无法生成二维码：链接过长",
+            ["NotifyQrError"] = "生成二维码时出错",
+            ["NotifySubInvalidUrl"] = "请输入有效的订阅链接",
+            ["NotifySubLoading"] = "正在加载订阅节点...",
+            ["NotifySubAllUpdating"] = "正在更新全部订阅...",
+            ["NotifySubAllUpdated"] = "全部订阅已更新",
+            ["NotifySubDeleted"] = "订阅已删除",
+            ["NotifySubDeviceLimit"] = "已达到该订阅的设备数量上限",
+            ["NotifySubLoadErrorFmt"] = "加载订阅失败 ({0})",
+            ["NotifySubAppUnsupported"] = "服务器拒绝请求 (App not supported)，请检查设备上限。",
+            ["NotifySubNoProfiles"] = "订阅中不包含受支持的节点",
+            ["NotifySubUpdatedCountFmt"] = "订阅已更新 (已加载节点: {0})",
+            ["NotifySubErrorFmt"] = "更新订阅失败: {0}",
+            ["NotifyRoutesReconnecting"] = "分流规则已修改，正在重连...",
+            ["NotifyLogLevelReconnecting"] = "日志级别已修改，正在重连...",
+            ["NotifyReconnectingServer"] = "切换节点，正在重连...",
+            ["NotifyModeReconnecting"] = "工作模式已修改，正在重连...",
+            ["NotifySettingsReconnecting"] = "设置已修改，正在重连...",
+            ["NotifyProfileUpdatedReconnecting"] = "配置已更新，正在重连...",
+            ["NotifyPortBusyFallbackFmt"] = "端口 {0} 已被占用，改用端口 {1}"
         },
-        ["zh-Hant"] = new()
+        ["zh-TW"] = new()
         {
-            {"Lang_Protocol", "協議"}, {"Lang_CtxConnect", "連接"},
-            {"Lang_CtxEdit", "編輯配置"}, {"Lang_CtxCopyLink", "複製連結"},
-            {"Lang_CtxMoveUp", "上移"}, {"Lang_CtxMoveDown", "下移"},
-            {"Lang_CtxDelete", "刪除"}, {"Lang_NavMain", "首頁"}, {"Lang_NavSettings", "設定"},
-            {"Lang_NavLogs", "日誌"}, {"Lang_Mode", "模式:"}, {"Lang_AddProfile", "新增配置"},
-            {"Lang_RefreshPing", "延遲測試"}, {"Lang_EmptyTitle", "沒有配置"},
-            {"Lang_EmptyDesc", "點擊新增配置以開始"}, {"Lang_SettingsTitle", "設定"},
-            {"Lang_StartupWork", "啟動與運行"}, {"Lang_AutoStart", "開機自啟"},
-            {"Lang_AutoConnectVpn", "啟動時自動連接 VPN"}, {"Lang_AutoConnectProxy", "啟動時自動連接 Proxy"},
-            {"Lang_StartMinimized", "靜默啟動到托盤"}, {"Lang_CustomConfig", "使用自訂 config.json"},
-            {"Lang_Appearance", "外觀"}, {"Lang_Language", "語言"}, {"Lang_Theme", "主題"},
-            {"Lang_ThemeDark", "深色"}, {"Lang_ThemeLight", "淺色"},
-            {"Lang_VisualEffects", "開啟視覺效果"}, {"Lang_DisableAnim", "關閉過渡動畫"},
-            {"Lang_NetRouting", "網絡與路由"}, {"Lang_RemoteDns", "遠端 DNS"},
-            {"Lang_ConfigureRoutes", "配置路由規則"}, {"Lang_AdvancedSettings", "進階設定"},
-            {"Lang_ProxyPort", "本地代理端口"}, {"Lang_AllowLan", "允許區域網連接"},
-            {"Lang_AllowLanHint", "允許同一 Wi-Fi 網絡中的其他設備連接到此代理。"},
-            {"Lang_TunStack", "TUN 網絡棧"},
-            {"Lang_CoreLogs", "核心日誌"}, {"Lang_LogLevel", "日誌級別: "}, {"Lang_AutoScroll", "自動滾動"},
-            {"Lang_Copy", "複製"}, {"Lang_Clear", "清空"},
-            {"Lang_AddProfileTitle", "新增配置"}, {"Lang_PasteClipboard", "從剪貼板導入"},
-            {"Lang_OrManual", "或手動輸入:"}, {"Lang_Cancel", "取消"}, {"Lang_Save", "保存"},
-            {"Lang_RoutingTitle", "路由規則"}, {"Lang_RoutingMode", "規則模式:"},
-            {"Lang_RouteBypass", "代理所有，除了..."}, {"Lang_RouteOnly", "僅代理..."},
-            {"Lang_DomainsDesc", "域名"}, {"Lang_Add", "新增"},
-            {"Lang_AppsDesc", "應用程式"}, {"Lang_Done", "完成"},
-            {"Lang_QRTitle", "配置 QR-Code"}, {"Lang_CopyLink", "複製連結"},
-            {"Lang_SearchPlaceholder", "搜尋配置..."}, {"Lang_BtnEnableVpn", "開啟 VPN"},
-            {"Lang_BtnDisableVpn", "關閉 VPN"}, {"Lang_BtnEnableProxy", "開啟 PROXY"},
-            {"Lang_BtnDisableProxy", "關閉 PROXY"},
-            {"Lang_ErrInvalidAddress", "無效地址"}, {"Lang_ErrInvalidPort", "無效端口"},
-            {"Lang_ErrSelectProfile", "請先選擇一個配置！"}, {"Lang_ErrWintun", "錯誤：未找到 wintun.dll！"},
-            {"Lang_ErrCrash", "Sing-box 核心崩潰。請檢查日誌。"},
-            {"Lang_MsgCopied", "已複製"}, {"Lang_MsgImportOk", "導入成功"},
-            {"Lang_ErrImport", "導入錯誤"},
-            {"Lang_LocUnknown", "未知"}, {"Lang_TrayRunning", "應用正在後台運行。"},
-            {"Lang_TrayUI", "打開介面"}, {"Lang_TrayExit", "退出"},
-            {"Lang_PingErr", "錯誤"}, {"Lang_PingTime", "超時"}, {"Lang_PingMs", "毫秒"},
-            {"Lang_FldName", "配置名稱"}, {"Lang_FldAddress", "地址/IP"},
-            {"Lang_FldPort", "端口"}, {"Lang_FldPassword", "密碼"},
-            {"Lang_FldUuid", "UUID / 用戶名"}, {"Lang_FldSni", "SNI"},
-            {"Lang_FldFp", "指紋 (Fingerprint)"}, {"Lang_FldInsecure", "忽略 TLS 證書錯誤"},
-            {"Lang_FldFlow", "流控 (Flow)"}, {"Lang_FldPbk", "Reality PBK"}, {"Lang_FldSid", "Reality SID"},
-            {"Lang_FldTransport", "傳輸方式 (Transport)"}, {"Lang_FldPath", "路徑 (Path)"},
-            {"Lang_FldHost", "主機 (Host)"}, {"Lang_FldSecurity", "安全 (Security)"}, {"Lang_FldAlterId", "額外ID (AlterID)"},
-            {"Lang_FldMethod", "加密方法"}, {"Lang_FldPubKey", "公鑰 (Public Key)"},
-            {"Lang_FldPrivKey", "私鑰 (Private Key)"}, {"Lang_FldLocalAddr", "本地地址"},
-            {"Lang_FldMtu", "MTU"}, {"Lang_FldAlpn", "ALPN"}, {"Lang_FldUpMbps", "上傳 Mbps"},
-            {"Lang_FldDownMbps", "下載 Mbps"}, {"Lang_FldObfs", "混淆類型"}, {"Lang_FldObfsPass", "混淆密碼"},
-            {"Lang_MsgRoutesChanged", "路由已更改，重新連接..."},
-            {"Lang_MsgLogLevelChanged", "日誌級別已更改，重新連接..."},
-            {"Lang_ErrQrTooLong", "無法生成 QR 碼：連結過長"},
-            {"Lang_ErrQrGen", "生成 QR 碼時發生錯誤"}
+            ["NavMain"] = "首頁",
+            ["NavSubs"] = "訂閱",
+            ["NavSettings"] = "設定",
+            ["NavLogs"] = "日誌",
+            ["ModeLabel"] = "運作模式:",
+            ["BtnAddProfile"] = "新增設定檔",
+            ["BtnRefreshPing"] = "重新整理延遲",
+            ["SearchPlaceholder"] = "搜尋節點...",
+            ["EmptyProfilesTitle"] = "尚無設定檔",
+            ["EmptyProfilesDesc"] = "點擊「新增設定檔」開始使用",
+            ["BtnAddSub"] = "新增訂閱",
+            ["BtnUpdateAllSubs"] = "更新全部",
+            ["EmptySubsTitle"] = "尚無訂閱",
+            ["EmptySubsDesc"] = "點擊「新增訂閱」獲取節點清單",
+            ["SettingsTitle"] = "設定",
+            ["GroupLaunch"] = "啟動設定",
+            ["AutoStart"] = "開機自動啟動",
+            ["StartMinimized"] = "啟動時最小化至系統匣",
+            ["MinimizeToTray"] = "關閉時最小化至系統匣",
+            ["AutoUpdateSubs"] = "啟動時自動更新訂閱",
+            ["CustomConfig"] = "使用自訂 config.json",
+            ["GroupAppearance"] = "外觀",
+            ["LangLabel"] = "介面語言 (Language)",
+            ["ThemeLabel"] = "主題",
+            ["ThemeSystem"] = "跟隨系統",
+            ["ThemeDark"] = "深色",
+            ["ThemeLight"] = "淺色",
+            ["VisualEffects"] = "啟用視覺效果",
+            ["DisableAnimations"] = "停用轉場動畫",
+            ["GroupNetwork"] = "網路與分流",
+            ["DnsLabel"] = "遠端 DNS",
+            ["DirectDnsLabel"] = "直連 DNS (Direct)",
+            ["BtnRouting"] = "設定分流規則",
+            ["GroupAdvanced"] = "進階選項",
+            ["ProxyPortLabel"] = "本機代理連接埠",
+            ["TunStackLabel"] = "TUN 網路堆疊",
+            ["StrictRoute"] = "TUN 嚴格路由 (Strict Route)",
+            ["EnableIpv6"] = "啟用 IPv6 (雙協定)",
+            ["AllowLan"] = "允許區域網路連線",
+            ["AllowLanDesc"] = "允許同 Wi-Fi 網路內的其他裝置連線代理。",
+            ["LogsTitle"] = "核心日誌",
+            ["LogLevelLabel"] = "層級: ",
+            ["AutoScroll"] = "自動捲動",
+            ["BtnCopyLogs"] = "複製",
+            ["BtnClearLogs"] = "清除",
+            ["ImportTitle"] = "新增設定檔",
+            ["EditTitle"] = "編輯設定檔",
+            ["PasteImport"] = "自剪貼簿貼上",
+            ["OrManual"] = "或手動新增:",
+            ["ProtocolLabel"] = "通訊協定",
+            ["Cancel"] = "取消",
+            ["Save"] = "儲存",
+            ["AddSubTitle"] = "新增訂閱",
+            ["SubNameLabel"] = "名稱 (選填)",
+            ["SubUrlLabel"] = "訂閱網址 (URL)",
+            ["Add"] = "新增",
+            ["RoutingTitle"] = "分流規則",
+            ["BypassRu"] = "不代理俄羅斯網站 (.ru, .рф)",
+            ["RouteModeLabel"] = "分流模式:",
+            ["RouteModeBypass"] = "略過清單中的項目...",
+            ["RouteModeOnly"] = "僅代理清單中的項目...",
+            ["DomainsLabel"] = "網站與網域 (例如 google.com)",
+            ["AppsLabel"] = "應用程式 (例如 telegram.exe)",
+            ["Done"] = "完成",
+            ["QRTitle"] = "設定檔 QR Code",
+            ["CopyLink"] = "複製連結",
+            ["CtxConnect"] = "連線",
+            ["CtxUrlTest"] = "HTTP 延遲測試",
+            ["CtxEdit"] = "編輯設定檔",
+            ["CtxCopy"] = "複製連結",
+            ["CtxUp"] = "上移",
+            ["CtxDown"] = "下移",
+            ["CtxDelete"] = "刪除",
+            ["TrafficInfinite"] = "流量: ∞",
+            ["ExpiresFmt"] = "到期: {0}",
+            ["UpdatedFmt"] = "已更新: {0}",
+            ["NeverUpdated"] = "尚未更新",
+            ["TooltipPing"] = "測試延遲",
+            ["TooltipUpdate"] = "更新",
+            ["TooltipDelete"] = "刪除",
+            ["PingMs"] = "ms",
+            ["PingTimeout"] = "逾時",
+            ["PingError"] = "錯誤",
+            ["UnknownLocation"] = "未知",
+            ["TrayModeFmt"] = "模式: {0}",
+            ["TrayExit"] = "結束",
+            ["TrayConnectVpn"] = "連線 VPN",
+            ["TrayDisconnectVpn"] = "中斷 VPN",
+            ["TrayConnectProxy"] = "連線 Proxy",
+            ["TrayDisconnectProxy"] = "中斷 Proxy",
+            ["TrayBgTip"] = "應用程式正在背景執行。",
+            ["BtnConnectVpn"] = "連線 VPN",
+            ["BtnDisconnectVpn"] = "中斷 VPN",
+            ["BtnConnectProxy"] = "連線 PROXY",
+            ["BtnDisconnectProxy"] = "中斷 PROXY",
+            ["AutoConnectVpn"] = "啟動時自動連線 VPN",
+            ["AutoConnectProxy"] = "啟動時自動連線 Proxy",
+            ["FieldName"] = "設定檔名稱",
+            ["FieldAddress"] = "伺服器位址 (IP 或網域)",
+            ["FieldPort"] = "連接埠",
+            ["FieldPassword"] = "密碼 (Password)",
+            ["FieldUuid"] = "UUID / 使用者名稱",
+            ["FieldSni"] = "SNI",
+            ["FieldFp"] = "Fingerprint (指紋)",
+            ["FieldInsecure"] = "忽略 TLS 憑證錯誤",
+            ["FieldFlow"] = "Flow",
+            ["FieldPbk"] = "Reality PBK",
+            ["FieldSid"] = "Reality SID",
+            ["FieldTransport"] = "傳輸協定 (tcp, ws...)",
+            ["FieldPath"] = "路徑 (Path)",
+            ["FieldHost"] = "偽裝網域 (Host)",
+            ["FieldSecurity"] = "加密方式 (Security)",
+            ["FieldAlterId"] = "AlterID",
+            ["FieldMethod"] = "加密方法",
+            ["FieldPublicKey"] = "公鑰 (Public Key)",
+            ["FieldPrivateKey"] = "私鑰 (Private Key)",
+            ["FieldLocalAddress"] = "本機位址 (Local Address)",
+            ["FieldMtu"] = "MTU",
+            ["FieldAlpn"] = "ALPN",
+            ["FieldUp"] = "上傳 Mbps",
+            ["FieldDown"] = "下載 Mbps",
+            ["FieldObfs"] = "混淆類型 (Obfs)",
+            ["FieldObfsPassword"] = "混淆密碼",
+            ["NotifySelectProfile"] = "請先選擇一個設定檔！",
+            ["NotifyAdminRequired"] = "需要系統管理員權限！",
+            ["NotifyWintunMissing"] = "錯誤：找不到 wintun.dll！",
+            ["NotifyCoreExited"] = "Sing-box 核心異常結束，請檢查日誌。",
+            ["NotifyCopied"] = "已複製到剪貼簿",
+            ["NotifyImported"] = "設定檔匯入成功",
+            ["NotifyImportError"] = "錯誤：剪貼簿中沒有有效的設定檔",
+            ["NotifyInvalidAddress"] = "請輸入有效的伺服器位址",
+            ["NotifyInvalidPort"] = "請輸入有效的連接埠 (1-65535)",
+            ["NotifyQrTooLong"] = "無法產生 QR Code：連結過長",
+            ["NotifyQrError"] = "產生 QR Code 時發生錯誤",
+            ["NotifySubInvalidUrl"] = "請輸入有效的訂閱網址",
+            ["NotifySubLoading"] = "正在載入訂閱節點...",
+            ["NotifySubAllUpdating"] = "正在更新全部訂閱...",
+            ["NotifySubAllUpdated"] = "已更新全部訂閱",
+            ["NotifySubDeleted"] = "訂閱已刪除",
+            ["NotifySubDeviceLimit"] = "已達到此訂閱的裝置數量上限",
+            ["NotifySubLoadErrorFmt"] = "載入訂閱失敗 ({0})",
+            ["NotifySubAppUnsupported"] = "伺服器拒絕請求 (App not supported)，請檢查裝置上限。",
+            ["NotifySubNoProfiles"] = "訂閱中不包含支援的節點",
+            ["NotifySubUpdatedCountFmt"] = "訂閱已更新 (已載入節點: {0})",
+            ["NotifySubErrorFmt"] = "更新訂閱失敗: {0}",
+            ["NotifyRoutesReconnecting"] = "分流規則已變更，正在重新連線...",
+            ["NotifyLogLevelReconnecting"] = "日誌層級已變更，正在重新連線...",
+            ["NotifyReconnectingServer"] = "切換節點，正在重新連線...",
+            ["NotifyModeReconnecting"] = "運作模式已變更，正在重新連線...",
+            ["NotifySettingsReconnecting"] = "設定已變更，正在重新連線...",
+            ["NotifyProfileUpdatedReconnecting"] = "設定檔已更新，正在重新連線...",
+            ["NotifyPortBusyFallbackFmt"] = "連接埠 {0} 已被佔用，改用連接埠 {1}"
         },
         ["ja"] = new()
         {
-            {"Lang_Protocol", "プロトコル"}, {"Lang_CtxConnect", "接続"},
-            {"Lang_CtxEdit", "プロファイル編集"}, {"Lang_CtxCopyLink", "リンクをコピー"},
-            {"Lang_CtxMoveUp", "上に移動"}, {"Lang_CtxMoveDown", "下に移動"},
-            {"Lang_CtxDelete", "削除"}, {"Lang_NavMain", "ホーム"}, {"Lang_NavSettings", "設定"},
-            {"Lang_NavLogs", "ログ"}, {"Lang_Mode", "モード:"}, {"Lang_AddProfile", "プロファイル追加"},
-            {"Lang_RefreshPing", "Ping更新"}, {"Lang_EmptyTitle", "プロファイルなし"},
-            {"Lang_EmptyDesc", "プロファイルを追加してください"}, {"Lang_SettingsTitle", "設定"},
-            {"Lang_StartupWork", "起動設定"}, {"Lang_AutoStart", "Windows起動時に実行"},
-            {"Lang_AutoConnectVpn", "起動時にVPN自動接続"}, {"Lang_AutoConnectProxy", "起動時にProxy自動接続"},
-            {"Lang_StartMinimized", "最小化して起動"}, {"Lang_CustomConfig", "カスタム config.jsonを使用"},
-            {"Lang_Appearance", "外観"}, {"Lang_Language", "言語"}, {"Lang_Theme", "テーマ"},
-            {"Lang_ThemeDark", "ダーク"}, {"Lang_ThemeLight", "ライト"},
-            {"Lang_VisualEffects", "視覚効果を有効にする"}, {"Lang_DisableAnim", "アニメーション無効"},
-            {"Lang_NetRouting", "ネットワークとルーティング"}, {"Lang_RemoteDns", "リモートDNS"},
-            {"Lang_ConfigureRoutes", "ルールの設定"}, {"Lang_AdvancedSettings", "詳細設定"},
-            {"Lang_ProxyPort", "Proxyポート"}, {"Lang_AllowLan", "LANからの接続を許可"},
-            {"Lang_AllowLanHint", "同じWi-Fi内の他のデバイスからこのプロキシへの接続を許可します。"},
-            {"Lang_TunStack", "TUNスタック"},
-            {"Lang_CoreLogs", "ログ"}, {"Lang_LogLevel", "レベル: "}, {"Lang_AutoScroll", "自動スクロール"},
-            {"Lang_Copy", "コピー"}, {"Lang_Clear", "クリア"},
-            {"Lang_AddProfileTitle", "プロファイル追加"}, {"Lang_PasteClipboard", "クリップボードから"},
-            {"Lang_OrManual", "手動追加:"}, {"Lang_Cancel", "キャンセル"}, {"Lang_Save", "保存"},
-            {"Lang_RoutingTitle", "ルーティングルール"}, {"Lang_RoutingMode", "モード:"},
-            {"Lang_RouteBypass", "すべてProxy（以下を除く）"}, {"Lang_RouteOnly", "以下のみProxy"},
-            {"Lang_DomainsDesc", "ドメイン"}, {"Lang_Add", "追加"},
-            {"Lang_AppsDesc", "アプリ"}, {"Lang_Done", "完了"},
-            {"Lang_QRTitle", "QRコード"}, {"Lang_CopyLink", "リンクをコピー"},
-            {"Lang_SearchPlaceholder", "検索..."}, {"Lang_BtnEnableVpn", "VPN オン"},
-            {"Lang_BtnDisableVpn", "VPN オフ"}, {"Lang_BtnEnableProxy", "PROXY オン"},
-            {"Lang_BtnDisableProxy", "PROXY オフ"},
-            {"Lang_ErrInvalidAddress", "無効なアドレス"}, {"Lang_ErrInvalidPort", "無効なポート"},
-            {"Lang_ErrSelectProfile", "最初にプロファイルを選択してください！"}, {"Lang_ErrWintun", "エラー: wintun.dll が見つかりません！"},
-            {"Lang_ErrCrash", "Sing-box がクラッシュしました。"},
-            {"Lang_MsgCopied", "コピーしました"}, {"Lang_MsgImportOk", "インポート成功"},
-            {"Lang_ErrImport", "インポートエラー"},
-            {"Lang_LocUnknown", "不明"}, {"Lang_TrayRunning", "アプリはバックグラウンドで実行中です。"},
-            {"Lang_TrayUI", "UIを開く"}, {"Lang_TrayExit", "終了"},
-            {"Lang_PingErr", "エラー"}, {"Lang_PingTime", "タイムアウト"}, {"Lang_PingMs", "ms"},
-            {"Lang_TimeDays", "日"}, {"Lang_TimeHours", "時間"}, {"Lang_TimeMinutes", "分"}, {"Lang_TimeSeconds", "秒"},
-            {"Lang_FldName", "プロファイル名"}, {"Lang_FldAddress", "アドレス/IP"},
-            {"Lang_FldPort", "ポート"}, {"Lang_FldPassword", "パスワード"},
-            {"Lang_FldUuid", "UUID / ユーザー名"}, {"Lang_FldSni", "SNI"},
-            {"Lang_FldFp", "Fingerprint"}, {"Lang_FldInsecure", "TLSエラーを無視"},
-            {"Lang_FldFlow", "Flow"}, {"Lang_FldPbk", "Reality PBK"}, {"Lang_FldSid", "Reality SID"},
-            {"Lang_FldTransport", "Transport"}, {"Lang_FldPath", "パス"},
-            {"Lang_FldHost", "Host"}, {"Lang_FldSecurity", "Security"}, {"Lang_FldAlterId", "AlterID"},
-            {"Lang_FldMethod", "暗号化方式"}, {"Lang_FldPubKey", "Public Key"},
-            {"Lang_FldPrivKey", "Private Key"}, {"Lang_FldLocalAddr", "ローカルIP"},
-            {"Lang_FldMtu", "MTU"}, {"Lang_FldAlpn", "ALPN"}, {"Lang_FldUpMbps", "アップロード Mbps"},
-            {"Lang_FldDownMbps", "ダウンロード Mbps"}, {"Lang_FldObfs", "Obfs タイプ"}, {"Lang_FldObfsPass", "Obfs パスワード"},
-            {"Lang_MsgRoutesChanged", "ルートが変更されました。再接続しています..."},
-            {"Lang_MsgLogLevelChanged", "ログレベルが変更されました。再接続しています..."},
-            {"Lang_ErrQrTooLong", "QRコードの生成に失敗しました：リンクが長すぎます"},
-            {"Lang_ErrQrGen", "QRコードの生成中にエラーが発生しました"}
+            ["NavMain"] = "ホーム",
+            ["NavSubs"] = "サブスク",
+            ["NavSettings"] = "設定",
+            ["NavLogs"] = "ログ",
+            ["ModeLabel"] = "動作モード:",
+            ["BtnAddProfile"] = "プロファイル追加",
+            ["BtnRefreshPing"] = "Ping更新",
+            ["SearchPlaceholder"] = "サーバー検索...",
+            ["EmptyProfilesTitle"] = "プロファイルがありません",
+            ["EmptyProfilesDesc"] = "「プロファイル追加」をクリックして開始",
+            ["BtnAddSub"] = "サブスク追加",
+            ["BtnUpdateAllSubs"] = "すべて更新",
+            ["EmptySubsTitle"] = "サブスクリプションがありません",
+            ["EmptySubsDesc"] = "「サブスク追加」をクリックしてサーバーを取得",
+            ["SettingsTitle"] = "設定",
+            ["GroupLaunch"] = "起動と動作",
+            ["AutoStart"] = "Windows起動時に実行",
+            ["StartMinimized"] = "トレイに最小化して起動",
+            ["MinimizeToTray"] = "閉じる時にトレイへ最小化",
+            ["AutoUpdateSubs"] = "起動時にサブスクを自動更新",
+            ["CustomConfig"] = "独自の config.json を使用",
+            ["GroupAppearance"] = "外観",
+            ["LangLabel"] = "言語 (Language)",
+            ["ThemeLabel"] = "テーマ",
+            ["ThemeSystem"] = "システム",
+            ["ThemeDark"] = "ダーク",
+            ["ThemeLight"] = "ライト",
+            ["VisualEffects"] = "視覚効果を有効にする",
+            ["DisableAnimations"] = "アニメーションを無効にする",
+            ["GroupNetwork"] = "ネットワークとルーティング",
+            ["DnsLabel"] = "リモートDNS",
+            ["DirectDnsLabel"] = "ダイレクトDNS",
+            ["BtnRouting"] = "ルーティングルールの設定",
+            ["GroupAdvanced"] = "詳細設定",
+            ["ProxyPortLabel"] = "ローカルプロキシポート",
+            ["TunStackLabel"] = "TUNスタック",
+            ["StrictRoute"] = "TUN Strict Route (厳格ルーティング)",
+            ["EnableIpv6"] = "IPv6 を有効にする (Dual-Stack)",
+            ["AllowLan"] = "LAN接続を許可",
+            ["AllowLanDesc"] = "同じWi-Fi内の他のデバイスからの接続を許可します。",
+            ["LogsTitle"] = "コアログ",
+            ["LogLevelLabel"] = "レベル: ",
+            ["AutoScroll"] = "自動スクロール",
+            ["BtnCopyLogs"] = "コピー",
+            ["BtnClearLogs"] = "消去",
+            ["ImportTitle"] = "プロファイルの追加",
+            ["EditTitle"] = "プロファイルを編集",
+            ["PasteImport"] = "クリップボードから貼り付け",
+            ["OrManual"] = "または手動で追加:",
+            ["ProtocolLabel"] = "プロトコル",
+            ["Cancel"] = "キャンセル",
+            ["Save"] = "保存",
+            ["AddSubTitle"] = "サブスク追加",
+            ["SubNameLabel"] = "名前 (省略可)",
+            ["SubUrlLabel"] = "サブスクリプションURL",
+            ["Add"] = "追加",
+            ["RoutingTitle"] = "ルーティング規則",
+            ["BypassRu"] = "ロシアのサイトをプロキシしない (.ru, .рф)",
+            ["RouteModeLabel"] = "ルールモード:",
+            ["RouteModeBypass"] = "リスト以外をすべてプロキシ...",
+            ["RouteModeOnly"] = "リストのみプロキシ...",
+            ["DomainsLabel"] = "ドメイン (例: google.com)",
+            ["AppsLabel"] = "アプリ (例: telegram.exe)",
+            ["Done"] = "完了",
+            ["QRTitle"] = "QRコード",
+            ["CopyLink"] = "リンクをコピー",
+            ["CtxConnect"] = "接続",
+            ["CtxUrlTest"] = "接続テスト (HTTP)",
+            ["CtxEdit"] = "プロファイルを編集",
+            ["CtxCopy"] = "リンクをコピー",
+            ["CtxUp"] = "上に移動",
+            ["CtxDown"] = "下に移動",
+            ["CtxDelete"] = "削除",
+            ["TrafficInfinite"] = "通信量: ∞",
+            ["ExpiresFmt"] = "有効期限: {0}",
+            ["UpdatedFmt"] = "更新日時: {0}",
+            ["NeverUpdated"] = "未更新",
+            ["TooltipPing"] = "Ping測定",
+            ["TooltipUpdate"] = "更新",
+            ["TooltipDelete"] = "削除",
+            ["PingMs"] = "ms",
+            ["PingTimeout"] = "タイムアウト",
+            ["PingError"] = "エラー",
+            ["UnknownLocation"] = "不明",
+            ["TrayModeFmt"] = "モード: {0}",
+            ["TrayExit"] = "終了",
+            ["TrayConnectVpn"] = "VPN接続",
+            ["TrayDisconnectVpn"] = "VPN切断",
+            ["TrayConnectProxy"] = "Proxy接続",
+            ["TrayDisconnectProxy"] = "Proxy切断",
+            ["TrayBgTip"] = "バックグラウンドで実行中です。",
+            ["BtnConnectVpn"] = "VPNに接続",
+            ["BtnDisconnectVpn"] = "VPNを切断",
+            ["BtnConnectProxy"] = "PROXYに接続",
+            ["BtnDisconnectProxy"] = "PROXYを切断",
+            ["AutoConnectVpn"] = "起動時に自動でVPNに接続",
+            ["AutoConnectProxy"] = "起動時に自動でProxyに接続",
+            ["FieldName"] = "プロファイル名",
+            ["FieldAddress"] = "アドレス (IPまたはドメイン)",
+            ["FieldPort"] = "ポート",
+            ["FieldPassword"] = "パスワード (Password)",
+            ["FieldUuid"] = "UUID / ユーザー名",
+            ["FieldSni"] = "SNI",
+            ["FieldFp"] = "Fingerprint",
+            ["FieldInsecure"] = "TLSエラーを無視",
+            ["FieldFlow"] = "Flow",
+            ["FieldPbk"] = "Reality PBK",
+            ["FieldSid"] = "Reality SID",
+            ["FieldTransport"] = "Transport (tcp, ws...)",
+            ["FieldPath"] = "パス (Path)",
+            ["FieldHost"] = "ホスト (Host)",
+            ["FieldSecurity"] = "Security",
+            ["FieldAlterId"] = "AlterID",
+            ["FieldMethod"] = "暗号化方式",
+            ["FieldPublicKey"] = "公開鍵 (Public Key)",
+            ["FieldPrivateKey"] = "秘密鍵 (Private Key)",
+            ["FieldLocalAddress"] = "ローカルアドレス",
+            ["FieldMtu"] = "MTU",
+            ["FieldAlpn"] = "ALPN",
+            ["FieldUp"] = "上り Mbps",
+            ["FieldDown"] = "下り Mbps",
+            ["FieldObfs"] = "Obfsタイプ",
+            ["FieldObfsPassword"] = "Obfsパスワード",
+            ["NotifySelectProfile"] = "先にプロファイルを選択してください！",
+            ["NotifyAdminRequired"] = "管理者権限が必要です！",
+            ["NotifyWintunMissing"] = "エラー: wintun.dll が見つかりません！",
+            ["NotifyCoreExited"] = "Sing-boxコアがエラー終了しました。ログを確認してください。",
+            ["NotifyCopied"] = "クリップボードにコピーしました",
+            ["NotifyImported"] = "プロファイルをインポートしました",
+            ["NotifyImportError"] = "エラー: 有効なプロファイルがありません",
+            ["NotifyInvalidAddress"] = "有効なサーバーアドレスを入力してください",
+            ["NotifyInvalidPort"] = "有効なポートを入力してください (1-65535)",
+            ["NotifyQrTooLong"] = "QRコードを生成できません: リンクが長すぎます",
+            ["NotifyQrError"] = "QRコードの生成中にエラーが発生しました",
+            ["NotifySubInvalidUrl"] = "有効なサブスクリプションURLを入力してください",
+            ["NotifySubLoading"] = "サブスクリプションを読み込み中...",
+            ["NotifySubAllUpdating"] = "すべてのサブスクを更新中...",
+            ["NotifySubAllUpdated"] = "すべてのサブスクを更新しました",
+            ["NotifySubDeleted"] = "サブスクを削除しました",
+            ["NotifySubDeviceLimit"] = "このサブスクのデバイス上限に達しました",
+            ["NotifySubLoadErrorFmt"] = "サブスクの読み込みエラー ({0})",
+            ["NotifySubAppUnsupported"] = "リクエストが拒否されました (App not supported)。デバイス数を確認してください。",
+            ["NotifySubNoProfiles"] = "対応するプロファイルが含まれていません",
+            ["NotifySubUpdatedCountFmt"] = "サブスクを更新しました (サーバー数: {0})",
+            ["NotifySubErrorFmt"] = "サブスク更新エラー: {0}",
+            ["NotifyRoutesReconnecting"] = "ルートを変更しました、再接続中...",
+            ["NotifyLogLevelReconnecting"] = "ログレベルを変更しました、再接続中...",
+            ["NotifyReconnectingServer"] = "サーバーを切り替え中、再接続中...",
+            ["NotifyModeReconnecting"] = "モードを変更しました、再接続中...",
+            ["NotifySettingsReconnecting"] = "設定を変更しました、再接続中...",
+            ["NotifyProfileUpdatedReconnecting"] = "プロファイルを更新しました、再接続中...",
+            ["NotifyPortBusyFallbackFmt"] = "ポート {0} は使用中のため、ポート {1} を使用します"
         },
         ["fa"] = new()
         {
-            {"Lang_Protocol", "پروتکل"}, {"Lang_CtxConnect", "اتصال"},
-            {"Lang_CtxEdit", "ویرایش پروفایل"}, {"Lang_CtxCopyLink", "کپی لینک"},
-            {"Lang_CtxMoveUp", "انتقال به بالا"}, {"Lang_CtxMoveDown", "انتقال به پایین"},
-            {"Lang_CtxDelete", "حذف"}, {"Lang_NavMain", "خانه"}, {"Lang_NavSettings", "تنظیمات"},
-            {"Lang_NavLogs", "گزارش‌ها"}, {"Lang_Mode", "حالت:"}, {"Lang_AddProfile", "افزودن پروفایل"},
-            {"Lang_RefreshPing", "بروزرسانی پینگ"}, {"Lang_EmptyTitle", "بدون پروفایل"},
-            {"Lang_EmptyDesc", "برای شروع «افزودن پروفایل» را بزنید"}, {"Lang_SettingsTitle", "تنظیمات"},
-            {"Lang_StartupWork", "راه‌اندازی"}, {"Lang_AutoStart", "اجرا در زمان شروع ویندوز"},
-            {"Lang_AutoConnectVpn", "اتصال خودکار VPN"}, {"Lang_AutoConnectProxy", "اتصال خودکار Proxy"},
-            {"Lang_StartMinimized", "اجرا کوچک شده"}, {"Lang_CustomConfig", "استفاده از config.json اختصاصی"},
-            {"Lang_Appearance", "ظاهر"}, {"Lang_Language", "زبان"}, {"Lang_Theme", "پوسته"},
-            {"Lang_ThemeDark", "تاریک"}, {"Lang_ThemeLight", "روشن"},
-            {"Lang_VisualEffects", "جلوه‌های بصری"}, {"Lang_DisableAnim", "غیرفعال‌سازی انیمیشن‌ها"},
-            {"Lang_NetRouting", "شبکه و مسیریابی"}, {"Lang_RemoteDns", "دی‌ان‌اس (DNS)"},
-            {"Lang_ConfigureRoutes", "تنظیم قوانین"}, {"Lang_AdvancedSettings", "تنظیمات پیشرفته"},
-            {"Lang_ProxyPort", "پورت پروکسی"}, {"Lang_AllowLan", "اجازه اتصال از شبکه محلی (LAN)"},
-            {"Lang_AllowLanHint", "به سایر دستگاه‌های شبکه اجازه می‌دهد به این پروکسی متصل شوند."},
-            {"Lang_TunStack", "پشته TUN"},
-            {"Lang_CoreLogs", "گزارش‌ها"}, {"Lang_LogLevel", "سطح: "}, {"Lang_AutoScroll", "پیمایش خودکار"},
-            {"Lang_Copy", "کپی"}, {"Lang_Clear", "پاک‌کردن"},
-            {"Lang_AddProfileTitle", "افزودن پروفایل"}, {"Lang_PasteClipboard", "از کلیپ‌بورد"},
-            {"Lang_OrManual", "یا دستی:"}, {"Lang_Cancel", "لغو"}, {"Lang_Save", "ذخیره"},
-            {"Lang_RoutingTitle", "قوانین مسیریابی"}, {"Lang_RoutingMode", "حالت:"},
-            {"Lang_RouteBypass", "پروکسی برای همه به جز..."}, {"Lang_RouteOnly", "پروکسی فقط برای..."},
-            {"Lang_DomainsDesc", "دامنه‌ها"}, {"Lang_Add", "افزودن"},
-            {"Lang_AppsDesc", "برنامه‌ها"}, {"Lang_Done", "انجام شد"},
-            {"Lang_QRTitle", "بارکد پروفایل (QR)"}, {"Lang_CopyLink", "کپی لینک"},
-            {"Lang_SearchPlaceholder", "جستجوی پروفایل..."}, {"Lang_BtnEnableVpn", "روشن کردن VPN"},
-            {"Lang_BtnDisableVpn", "خاموش کردن VPN"}, {"Lang_BtnEnableProxy", "روشن کردن PROXY"},
-            {"Lang_BtnDisableProxy", "خاموش کردن PROXY"},
-            {"Lang_ErrInvalidAddress", "آدرس نامعتبر"}, {"Lang_ErrInvalidPort", "پورت نامعتبر"},
-            {"Lang_ErrSelectProfile", "ابتدا یک پروفایل انتخاب کنید!"}, {"Lang_ErrWintun", "خطا: wintun.dll یافت نشد!"},
-            {"Lang_ErrCrash", "هسته Sing-box متوقف شد."},
-            {"Lang_MsgCopied", "کپی شد"}, {"Lang_MsgImportOk", "با موفقیت وارد شد"},
-            {"Lang_ErrImport", "خطای وارد کردن"},
-            {"Lang_LocUnknown", "نامشخص"}, {"Lang_TrayRunning", "برنامه در پس‌زمینه در حال اجرا است."},
-            {"Lang_TrayUI", "رابط کاربری"}, {"Lang_TrayExit", "خروج"},
-            {"Lang_PingErr", "خطا"}, {"Lang_PingTime", "تایم‌اوت"}, {"Lang_PingMs", "ms"},
-            {"Lang_FldName", "نام پروفایل"}, {"Lang_FldAddress", "آدرس/آی‌پی"},
-            {"Lang_FldPort", "پورت"}, {"Lang_FldPassword", "رمز عبور"},
-            {"Lang_FldUuid", "UUID / نام کاربری"}, {"Lang_FldSni", "SNI"},
-            {"Lang_FldFp", "Fingerprint"}, {"Lang_FldInsecure", "نادیده گرفتن خطای TLS"},
-            {"Lang_FldFlow", "Flow"}, {"Lang_FldPbk", "Reality PBK"}, {"Lang_FldSid", "Reality SID"},
-            {"Lang_FldTransport", "Transport"}, {"Lang_FldPath", "مسیر (Path)"},
-            {"Lang_FldHost", "Host"}, {"Lang_FldSecurity", "Security"}, {"Lang_FldAlterId", "AlterID"},
-            {"Lang_FldMethod", "روش رمزگذاری"}, {"Lang_FldPubKey", "کلید عمومی"},
-            {"Lang_FldPrivKey", "کلید خصوصی"}, {"Lang_FldLocalAddr", "آدرس محلی"},
-            {"Lang_FldMtu", "MTU"}, {"Lang_FldAlpn", "ALPN"}, {"Lang_FldUpMbps", "آپلود Mbps"},
-            {"Lang_FldDownMbps", "دانلود Mbps"}, {"Lang_FldObfs", "نوع Obfs"}, {"Lang_FldObfsPass", "رمز Obfs"},
-            {"Lang_MsgRoutesChanged", "مسیرها تغییر کردند، در حال اتصال مجدد..."},
-            {"Lang_MsgLogLevelChanged", "سطح گزارش تغییر کرد، در حال اتصال مجدد..."},
-            {"Lang_ErrQrTooLong", "تولید بارکد (QR) ناموفق بود: لینک بیش از حد طولانی است"},
-            {"Lang_ErrQrGen", "خطایی در تولید بارکد (QR) رخ داد"}
+            ["NavMain"] = "اصلی",
+            ["NavSubs"] = "اشتراک‌ها",
+            ["NavSettings"] = "تنظیمات",
+            ["NavLogs"] = "گزارش‌ها",
+            ["ModeLabel"] = "حالت کارکرد:",
+            ["BtnAddProfile"] = "افزودن پروفایل",
+            ["BtnRefreshPing"] = "بروزرسانی پینگ",
+            ["SearchPlaceholder"] = "جستجوی سرورها...",
+            ["EmptyProfilesTitle"] = "پروفایلی وجود ندارد",
+            ["EmptyProfilesDesc"] = "روی «افزودن پروفایل» کلیک کنید",
+            ["BtnAddSub"] = "افزودن اشتراک",
+            ["BtnUpdateAllSubs"] = "بروزرسانی همه",
+            ["EmptySubsTitle"] = "اشتراکی وجود ندارد",
+            ["EmptySubsDesc"] = "روی «افزودن اشتراک» کلیک کنید",
+            ["SettingsTitle"] = "تنظیمات",
+            ["GroupLaunch"] = "راه‌اندازی و اجرا",
+            ["AutoStart"] = "اجرا با ویندوز",
+            ["StartMinimized"] = "اجرا به صورت کوچک در پس‌زمینه",
+            ["MinimizeToTray"] = "کوچک کردن در پس‌زمینه هنگام بستن",
+            ["AutoUpdateSubs"] = "بروزرسانی خودکار اشتراک‌ها هنگام اجرا",
+            ["CustomConfig"] = "استفاده از config.json شخصی",
+            ["GroupAppearance"] = "ظاهر",
+            ["LangLabel"] = "زبان رابط کاربری (Language)",
+            ["ThemeLabel"] = "پوسته",
+            ["ThemeSystem"] = "سیستم",
+            ["ThemeDark"] = "تیره",
+            ["ThemeLight"] = "روشن",
+            ["VisualEffects"] = "فعال‌سازی جلوه‌های بصری",
+            ["DisableAnimations"] = "غیرفعال‌سازی انیمیشن‌ها",
+            ["GroupNetwork"] = "شبکه و مسیریابی",
+            ["DnsLabel"] = "دی‌ان‌اس راه دور (Remote)",
+            ["DirectDnsLabel"] = "دی‌ان‌اس مستقیم (Direct)",
+            ["BtnRouting"] = "تنظیم قوانین مسیریابی",
+            ["GroupAdvanced"] = "تنظیمات پیشرفته",
+            ["ProxyPortLabel"] = "پورت پروکسی محلی",
+            ["TunStackLabel"] = "استک شبکه TUN",
+            ["StrictRoute"] = "مسیریابی دقیق TUN (Strict Route)",
+            ["EnableIpv6"] = "فعال‌سازی IPv6 (Dual-Stack)",
+            ["AllowLan"] = "اجازه به شبکه محلی (LAN)",
+            ["AllowLanDesc"] = "امکان اتصال سایر دستگاه‌های شبکه محلی به پروکسی.",
+            ["LogsTitle"] = "گزارش‌های هسته",
+            ["LogLevelLabel"] = "سطح: ",
+            ["AutoScroll"] = "اسکرول خودکار",
+            ["BtnCopyLogs"] = "کپی",
+            ["BtnClearLogs"] = "پاک‌سازی",
+            ["ImportTitle"] = "افزودن سرور",
+            ["EditTitle"] = "ویرایش سرور",
+            ["PasteImport"] = "جای‌گذاری از کلیپ‌بورد",
+            ["OrManual"] = "یا افزودن دستی:",
+            ["ProtocolLabel"] = "پروتکل",
+            ["Cancel"] = "لغو",
+            ["Save"] = "ذخیره",
+            ["AddSubTitle"] = "افزودن اشتراک",
+            ["SubNameLabel"] = "نام (اختیاری)",
+            ["SubUrlLabel"] = "لینک اشتراک (URL)",
+            ["Add"] = "افزودن",
+            ["RoutingTitle"] = "قوانین مسیریابی",
+            ["BypassRu"] = "عبور مستقیم سایت‌های روسی (.ru, .рф)",
+            ["RouteModeLabel"] = "حالت قوانین:",
+            ["RouteModeBypass"] = "فعال برای همه به جز...",
+            ["RouteModeOnly"] = "فعال فقط برای...",
+            ["DomainsLabel"] = "دامنه‌ها (مانند google.com)",
+            ["AppsLabel"] = "برنامه‌ها (مانند telegram.exe)",
+            ["Done"] = "انجام شد",
+            ["QRTitle"] = "کد QR سرور",
+            ["CopyLink"] = "کپی لینک",
+            ["CtxConnect"] = "اتصال",
+            ["CtxUrlTest"] = "تست اتصال (HTTP)",
+            ["CtxEdit"] = "ویرایش سرور",
+            ["CtxCopy"] = "کپی لینک",
+            ["CtxUp"] = "انتقال به بالا",
+            ["CtxDown"] = "انتقال به پایین",
+            ["CtxDelete"] = "حذف",
+            ["TrafficInfinite"] = "ترافیک: ∞",
+            ["ExpiresFmt"] = "انقضا: {0}",
+            ["UpdatedFmt"] = "بروزرسانی: {0}",
+            ["NeverUpdated"] = "هنوز بروزرسانی نشده",
+            ["TooltipPing"] = "تست پینگ",
+            ["TooltipUpdate"] = "بروزرسانی",
+            ["TooltipDelete"] = "حذف",
+            ["PingMs"] = "ms",
+            ["PingTimeout"] = "اتمام زمان",
+            ["PingError"] = "خطا",
+            ["UnknownLocation"] = "نامشخص",
+            ["TrayModeFmt"] = "حالت: {0}",
+            ["TrayExit"] = "خروج",
+            ["TrayConnectVpn"] = "اتصال VPN",
+            ["TrayDisconnectVpn"] = "قطع VPN",
+            ["TrayConnectProxy"] = "اتصال Proxy",
+            ["TrayDisconnectProxy"] = "قطع Proxy",
+            ["TrayBgTip"] = "برنامه در پس‌زمینه در حال اجرا است.",
+            ["BtnConnectVpn"] = "اتصال VPN",
+            ["BtnDisconnectVpn"] = "قطع VPN",
+            ["BtnConnectProxy"] = "اتصال PROXY",
+            ["BtnDisconnectProxy"] = "قطع PROXY",
+            ["AutoConnectVpn"] = "اتصال خودکار VPN هنگام اجرا",
+            ["AutoConnectProxy"] = "اتصال خودکار Proxy هنگام اجرا",
+            ["FieldName"] = "نام پروفایل",
+            ["FieldAddress"] = "آدرس (IP یا دامنه)",
+            ["FieldPort"] = "پورت",
+            ["FieldPassword"] = "رمز عبور (Password)",
+            ["FieldUuid"] = "UUID / نام کاربری",
+            ["FieldSni"] = "SNI",
+            ["FieldFp"] = "Fingerprint",
+            ["FieldInsecure"] = "نادیده گرفتن خطای TLS",
+            ["FieldFlow"] = "Flow",
+            ["FieldPbk"] = "Reality PBK",
+            ["FieldSid"] = "Reality SID",
+            ["FieldTransport"] = "Transport (tcp, ws...)",
+            ["FieldPath"] = "مسیر (Path)",
+            ["FieldHost"] = "Host",
+            ["FieldSecurity"] = "Security",
+            ["FieldAlterId"] = "AlterID",
+            ["FieldMethod"] = "روش رمزنگاری",
+            ["FieldPublicKey"] = "کلید عمومی (Public Key)",
+            ["FieldPrivateKey"] = "کلید خصوصی (Private Key)",
+            ["FieldLocalAddress"] = "آدرس محلی",
+            ["FieldMtu"] = "MTU",
+            ["FieldAlpn"] = "ALPN",
+            ["FieldUp"] = "آپلود Mbps",
+            ["FieldDown"] = "دانلود Mbps",
+            ["FieldObfs"] = "نوع Obfs",
+            ["FieldObfsPassword"] = "رمز Obfs",
+            ["NotifySelectProfile"] = "لطفاً ابتدا یک سرور را انتخاب کنید!",
+            ["NotifyAdminRequired"] = "دسترسی ادمین مورد نیاز است!",
+            ["NotifyWintunMissing"] = "خطا: فایل wintun.dll یافت نشد!",
+            ["NotifyCoreExited"] = "هسته Sing-box با خطا متوقف شد. گزارش‌ها را بررسی کنید.",
+            ["NotifyCopied"] = "در کلیپ‌بورد کپی شد",
+            ["NotifyImported"] = "سرور با موفقیت اضافه شد",
+            ["NotifyImportError"] = "خطا: سروری در کلیپ‌بورد یافت نشد",
+            ["NotifyInvalidAddress"] = "آدرس معتبر وارد کنید",
+            ["NotifyInvalidPort"] = "پورت معتبر وارد کنید (1-65535)",
+            ["NotifyQrTooLong"] = "امکان ساخت QR نیست: لینک بیش از حد طولانی است",
+            ["NotifyQrError"] = "خطا در ساخت کد QR",
+            ["NotifySubInvalidUrl"] = "لینک اشتراک معتبر وارد کنید",
+            ["NotifySubLoading"] = "در حال دریافت سرورهای اشتراک...",
+            ["NotifySubAllUpdating"] = "در حال بروزرسانی همه اشتراک‌ها...",
+            ["NotifySubAllUpdated"] = "همه اشتراک‌ها بروزرسانی شدند",
+            ["NotifySubDeleted"] = "اشتراک حذف شد",
+            ["NotifySubDeviceLimit"] = "محدودیت دستگاه برای این اشتراک تکمیل شده است",
+            ["NotifySubLoadErrorFmt"] = "خطا در دریافت اشتراک ({0})",
+            ["NotifySubAppUnsupported"] = "درخواست رد شد (App not supported). محدودیت دستگاه را بررسی کنید.",
+            ["NotifySubNoProfiles"] = "اشتراک هیچ سرور پشتیبانی‌شده‌ای ندارد",
+            ["NotifySubUpdatedCountFmt"] = "اشتراک بروزرسانی شد (تعداد سرورها: {0})",
+            ["NotifySubErrorFmt"] = "خطا در بروزرسانی اشتراک: {0}",
+            ["NotifyRoutesReconnecting"] = "قوانین تغییر کرد، در حال اتصال مجدد...",
+            ["NotifyLogLevelReconnecting"] = "سطح گزارش تغییر کرد، در حال اتصال مجدد...",
+            ["NotifyReconnectingServer"] = "تغییر سرور، در حال اتصال مجدد...",
+            ["NotifyModeReconnecting"] = "حالت کارکرد تغییر کرد، در حال اتصال مجدد...",
+            ["NotifySettingsReconnecting"] = "تنظیمات تغییر کرد، در حال اتصال مجدد...",
+            ["NotifyProfileUpdatedReconnecting"] = "پروفایل ویرایش شد، در حال اتصال مجدد...",
+            ["NotifyPortBusyFallbackFmt"] = "پورت {0} اشغال است، از پورت {1} استفاده می‌شود"
         }
     };
 
-    public static string GetString(string key) =>
-        Application.Current?.Resources is { } res && res.Contains(key) ? res[key]?.ToString() ?? key : key;
+    public static string L(string key)
+    {
+        if (_translations.TryGetValue(CurrentLanguage, out var dict) && dict.TryGetValue(key, out var val))
+            return val;
+        if (_translations["ru"].TryGetValue(key, out var fallback))
+            return fallback;
+        return key;
+    }
+
+    private static readonly Dictionary<string, Dictionary<string, string>> _countryNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["US"] = new() { ["ru"] = "США", ["en"] = "United States", ["uk"] = "США", ["de"] = "USA", ["zh-CN"] = "美国", ["zh-TW"] = "美國", ["ja"] = "アメリカ", ["fa"] = "ایالات متحده" },
+        ["GB"] = new() { ["ru"] = "Великобритания", ["en"] = "United Kingdom", ["uk"] = "Велика Британія", ["de"] = "Vereinigtes Königreich", ["zh-CN"] = "英国", ["zh-TW"] = "英國", ["ja"] = "イギリス", ["fa"] = "بریتانیا" },
+        ["DE"] = new() { ["ru"] = "Германия", ["en"] = "Germany", ["uk"] = "Німеччина", ["de"] = "Deutschland", ["zh-CN"] = "德国", ["zh-TW"] = "德國", ["ja"] = "ドイツ", ["fa"] = "آلمان" },
+        ["NL"] = new() { ["ru"] = "Нидерланды", ["en"] = "Netherlands", ["uk"] = "Нідерланди", ["de"] = "Niederlande", ["zh-CN"] = "荷兰", ["zh-TW"] = "荷蘭", ["ja"] = "オランダ", ["fa"] = "هلند" },
+        ["FI"] = new() { ["ru"] = "Финляндия", ["en"] = "Finland", ["uk"] = "Фінляндія", ["de"] = "Finnland", ["zh-CN"] = "芬兰", ["zh-TW"] = "芬蘭", ["ja"] = "フィンランド", ["fa"] = "فنلاند" },
+        ["EE"] = new() { ["ru"] = "Эстония", ["en"] = "Estonia", ["uk"] = "Естонія", ["de"] = "Estland", ["zh-CN"] = "爱沙尼亚", ["zh-TW"] = "愛沙尼亞", ["ja"] = "エストニア", ["fa"] = "استونی" },
+        ["PL"] = new() { ["ru"] = "Польша", ["en"] = "Poland", ["uk"] = "Польща", ["de"] = "Polen", ["zh-CN"] = "波兰", ["zh-TW"] = "波蘭", ["ja"] = "ポーランド", ["fa"] = "لهستان" },
+        ["SE"] = new() { ["ru"] = "Швеция", ["en"] = "Sweden", ["uk"] = "Швеція", ["de"] = "Schweden", ["zh-CN"] = "瑞典", ["zh-TW"] = "瑞典", ["ja"] = "スウェーデン", ["fa"] = "سوئد" },
+        ["FR"] = new() { ["ru"] = "Франция", ["en"] = "France", ["uk"] = "Франція", ["de"] = "Frankreich", ["zh-CN"] = "法国", ["zh-TW"] = "法國", ["ja"] = "フランス", ["fa"] = "فرانسه" },
+        ["AT"] = new() { ["ru"] = "Австрия", ["en"] = "Austria", ["uk"] = "Австрія", ["de"] = "Österreich", ["zh-CN"] = "奥地利", ["zh-TW"] = "奧地利", ["ja"] = "オーストリア", ["fa"] = "اتریش" },
+        ["CH"] = new() { ["ru"] = "Швейцария", ["en"] = "Switzerland", ["uk"] = "Швейцарія", ["de"] = "Schweiz", ["zh-CN"] = "瑞士", ["zh-TW"] = "瑞士", ["ja"] = "スイス", ["fa"] = "سوئیس" },
+        ["IE"] = new() { ["ru"] = "Ирландия", ["en"] = "Ireland", ["uk"] = "Ірландія", ["de"] = "Irland", ["zh-CN"] = "爱尔兰", ["zh-TW"] = "愛爾蘭", ["ja"] = "アイルランド", ["fa"] = "ایرلند" },
+        ["NO"] = new() { ["ru"] = "Норвегия", ["en"] = "Norway", ["uk"] = "Норвегія", ["de"] = "Norwegen", ["zh-CN"] = "挪威", ["zh-TW"] = "挪威", ["ja"] = "ノルウェー", ["fa"] = "نروژ" },
+        ["DK"] = new() { ["ru"] = "Дания", ["en"] = "Denmark", ["uk"] = "Данія", ["de"] = "Dänemark", ["zh-CN"] = "丹麦", ["zh-TW"] = "丹麥", ["ja"] = "デンマーク", ["fa"] = "دانمارک" },
+        ["IT"] = new() { ["ru"] = "Италия", ["en"] = "Italy", ["uk"] = "Італія", ["de"] = "Italien", ["zh-CN"] = "意大利", ["zh-TW"] = "義大利", ["ja"] = "イタリア", ["fa"] = "ایتالیا" },
+        ["ES"] = new() { ["ru"] = "Испания", ["en"] = "Spain", ["uk"] = "Іспанія", ["de"] = "Spanien", ["zh-CN"] = "西班牙", ["zh-TW"] = "西班牙", ["ja"] = "スペイン", ["fa"] = "اسپانیا" },
+        ["PT"] = new() { ["ru"] = "Португалия", ["en"] = "Portugal", ["uk"] = "Португалія", ["de"] = "Portugal", ["zh-CN"] = "葡萄牙", ["zh-TW"] = "葡萄牙", ["ja"] = "ポルトガル", ["fa"] = "پرتغال" },
+        ["CZ"] = new() { ["ru"] = "Чехия", ["en"] = "Czechia", ["uk"] = "Чехія", ["de"] = "Tschechien", ["zh-CN"] = "捷克", ["zh-TW"] = "捷克", ["ja"] = "チェコ", ["fa"] = "جمهوری چک" },
+        ["RO"] = new() { ["ru"] = "Румыния", ["en"] = "Romania", ["uk"] = "Румунія", ["de"] = "Rumänien", ["zh-CN"] = "罗马尼亚", ["zh-TW"] = "羅馬尼亞", ["ja"] = "ルーマニア", ["fa"] = "رومانی" },
+        ["BG"] = new() { ["ru"] = "Болгария", ["en"] = "Bulgaria", ["uk"] = "Болгарія", ["de"] = "Bulgarien", ["zh-CN"] = "保加利亚", ["zh-TW"] = "保加利亞", ["ja"] = "ブルガリア", ["fa"] = "بلغارستان" },
+        ["HU"] = new() { ["ru"] = "Венгрия", ["en"] = "Hungary", ["uk"] = "Угорщина", ["de"] = "Ungarn", ["zh-CN"] = "匈牙利", ["zh-TW"] = "匈牙利", ["ja"] = "ハンガリー", ["fa"] = "مجارستان" },
+        ["SK"] = new() { ["ru"] = "Словакия", ["en"] = "Slovakia", ["uk"] = "Словаччина", ["de"] = "Slowakei", ["zh-CN"] = "斯洛伐克", ["zh-TW"] = "斯洛伐克", ["ja"] = "スロバキア", ["fa"] = "اسلواکی" },
+        ["SI"] = new() { ["ru"] = "Словения", ["en"] = "Slovenia", ["uk"] = "Словенія", ["de"] = "Slowenien", ["zh-CN"] = "斯洛文尼亚", ["zh-TW"] = "斯洛維尼亞", ["ja"] = "スロベニア", ["fa"] = "اسلوونی" },
+        ["GR"] = new() { ["ru"] = "Греция", ["en"] = "Greece", ["uk"] = "Греція", ["de"] = "Griechenland", ["zh-CN"] = "希腊", ["zh-TW"] = "希臘", ["ja"] = "ギリシャ", ["fa"] = "یونان" },
+        ["CY"] = new() { ["ru"] = "Кипр", ["en"] = "Cyprus", ["uk"] = "Кіпр", ["de"] = "Zypern", ["zh-CN"] = "塞浦路斯", ["zh-TW"] = "賽普勒斯", ["ja"] = "キプロス", ["fa"] = "قبرس" },
+        ["RS"] = new() { ["ru"] = "Сербия", ["en"] = "Serbia", ["uk"] = "Сербія", ["de"] = "Serbien", ["zh-CN"] = "塞尔维亚", ["zh-TW"] = "塞爾維亞", ["ja"] = "セルビア", ["fa"] = "صربستان" },
+        ["LV"] = new() { ["ru"] = "Латвия", ["en"] = "Latvia", ["uk"] = "Латвія", ["de"] = "Lettland", ["zh-CN"] = "拉脱维亚", ["zh-TW"] = "拉脫維亞", ["ja"] = "ラトビア", ["fa"] = "لتونی" },
+        ["LT"] = new() { ["ru"] = "Литва", ["en"] = "Lithuania", ["uk"] = "Литва", ["de"] = "Litauen", ["zh-CN"] = "立陶宛", ["zh-TW"] = "立陶宛", ["ja"] = "リトアニア", ["fa"] = "لیتوانی" },
+        ["IS"] = new() { ["ru"] = "Исландия", ["en"] = "Iceland", ["uk"] = "Ісландія", ["de"] = "Island", ["zh-CN"] = "冰岛", ["zh-TW"] = "冰島", ["ja"] = "アイスランド", ["fa"] = "ایسلند" },
+        ["UA"] = new() { ["ru"] = "Украина", ["en"] = "Ukraine", ["uk"] = "Україна", ["de"] = "Ukraine", ["zh-CN"] = "乌克兰", ["zh-TW"] = "烏克蘭", ["ja"] = "ウクライナ", ["fa"] = "اوکراین" },
+        ["RU"] = new() { ["ru"] = "Россия", ["en"] = "Russia", ["uk"] = "Росія", ["de"] = "Russland", ["zh-CN"] = "俄罗斯", ["zh-TW"] = "俄羅斯", ["ja"] = "ロシア", ["fa"] = "روسیه" },
+        ["BY"] = new() { ["ru"] = "Беларусь", ["en"] = "Belarus", ["uk"] = "Білорусь", ["de"] = "Belarus", ["zh-CN"] = "白俄罗斯", ["zh-TW"] = "白俄羅斯", ["ja"] = "ベラルーシ", ["fa"] = "بلاروس" },
+        ["MD"] = new() { ["ru"] = "Молдова", ["en"] = "Moldova", ["uk"] = "Молдова", ["de"] = "Moldau", ["zh-CN"] = "摩尔多瓦", ["zh-TW"] = "摩爾多瓦", ["ja"] = "モルドバ", ["fa"] = "مولداوی" },
+        ["KZ"] = new() { ["ru"] = "Казахстан", ["en"] = "Kazakhstan", ["uk"] = "Казахстан", ["de"] = "Kasachstan", ["zh-CN"] = "哈萨克斯坦", ["zh-TW"] = "哈薩克", ["ja"] = "カザフスタン", ["fa"] = "قزاقستان" },
+        ["GE"] = new() { ["ru"] = "Грузия", ["en"] = "Georgia", ["uk"] = "Грузія", ["de"] = "Georgien", ["zh-CN"] = "格鲁吉亚", ["zh-TW"] = "喬治亞", ["ja"] = "ジョージア", ["fa"] = "گرجستان" },
+        ["AM"] = new() { ["ru"] = "Армения", ["en"] = "Armenia", ["uk"] = "Вірменія", ["de"] = "Armenien", ["zh-CN"] = "亚美尼亚", ["zh-TW"] = "亞美尼亞", ["ja"] = "アルメニア", ["fa"] = "ارمنستان" },
+        ["AZ"] = new() { ["ru"] = "Азербайджан", ["en"] = "Azerbaijan", ["uk"] = "Азербайджан", ["de"] = "Aserbaidschan", ["zh-CN"] = "阿塞拜疆", ["zh-TW"] = "亞塞拜然", ["ja"] = "アゼルバイジャン", ["fa"] = "آذربایجان" },
+        ["UZ"] = new() { ["ru"] = "Узбекистан", ["en"] = "Uzbekistan", ["uk"] = "Узбекистан", ["de"] = "Usbekistan", ["zh-CN"] = "乌兹别克斯坦", ["zh-TW"] = "烏茲別克", ["ja"] = "ウズベキスタン", ["fa"] = "ازبکستان" },
+        ["TR"] = new() { ["ru"] = "Турция", ["en"] = "Turkey", ["uk"] = "Туреччина", ["de"] = "Türkei", ["zh-CN"] = "土耳其", ["zh-TW"] = "土耳其", ["ja"] = "トルコ", ["fa"] = "ترکیه" },
+        ["IL"] = new() { ["ru"] = "Израиль", ["en"] = "Israel", ["uk"] = "Ізраїль", ["de"] = "Israel", ["zh-CN"] = "以色列", ["zh-TW"] = "以色列", ["ja"] = "イスラエル", ["fa"] = "اسرائیل" },
+        ["AE"] = new() { ["ru"] = "ОАЭ", ["en"] = "UAE", ["uk"] = "ОАЕ", ["de"] = "VAE", ["zh-CN"] = "阿联酋", ["zh-TW"] = "阿聯", ["ja"] = "アラブ首長国連邦", ["fa"] = "امارات" },
+        ["CA"] = new() { ["ru"] = "Канада", ["en"] = "Canada", ["uk"] = "Канада", ["de"] = "Kanada", ["zh-CN"] = "加拿大", ["zh-TW"] = "加拿大", ["ja"] = "カナダ", ["fa"] = "کانادا" },
+        ["BR"] = new() { ["ru"] = "Бразилия", ["en"] = "Brazil", ["uk"] = "Бразилія", ["de"] = "Brasilien", ["zh-CN"] = "巴西", ["zh-TW"] = "巴西", ["ja"] = "ブラジル", ["fa"] = "برزیل" },
+        ["JP"] = new() { ["ru"] = "Япония", ["en"] = "Japan", ["uk"] = "Японія", ["de"] = "Japan", ["zh-CN"] = "日本", ["zh-TW"] = "日本", ["ja"] = "日本", ["fa"] = "ژاپن" },
+        ["SG"] = new() { ["ru"] = "Сингапур", ["en"] = "Singapore", ["uk"] = "Сінгапур", ["de"] = "Singapur", ["zh-CN"] = "新加坡", ["zh-TW"] = "新加坡", ["ja"] = "シンガポール", ["fa"] = "سنگاپور" },
+        ["HK"] = new() { ["ru"] = "Гонконг", ["en"] = "Hong Kong", ["uk"] = "Гонконг", ["de"] = "Hongkong", ["zh-CN"] = "香港", ["zh-TW"] = "香港", ["ja"] = "香港", ["fa"] = "هنگ‌کنگ" },
+        ["TW"] = new() { ["ru"] = "Тайвань", ["en"] = "Taiwan", ["uk"] = "Тайвань", ["de"] = "Taiwan", ["zh-CN"] = "台湾", ["zh-TW"] = "台灣", ["ja"] = "台湾", ["fa"] = "تایوان" },
+        ["KR"] = new() { ["ru"] = "Южная Корея", ["en"] = "South Korea", ["uk"] = "Південна Корея", ["de"] = "Südkorea", ["zh-CN"] = "韩国", ["zh-TW"] = "韓國", ["ja"] = "韓国", ["fa"] = "کره جنوبی" },
+        ["IN"] = new() { ["ru"] = "Индия", ["en"] = "India", ["uk"] = "Індія", ["de"] = "Indien", ["zh-CN"] = "印度", ["zh-TW"] = "印度", ["ja"] = "インド", ["fa"] = "هند" },
+        ["AU"] = new() { ["ru"] = "Австралия", ["en"] = "Australia", ["uk"] = "Австралія", ["de"] = "Australien", ["zh-CN"] = "澳大利亚", ["zh-TW"] = "澳洲", ["ja"] = "オーストラリア", ["fa"] = "استرالیا" },
+        ["CN"] = new() { ["ru"] = "Китай", ["en"] = "China", ["uk"] = "Китай", ["de"] = "China", ["zh-CN"] = "中国", ["zh-TW"] = "中國", ["ja"] = "中国", ["fa"] = "چین" },
+        ["BE"] = new() { ["ru"] = "Бельгия", ["en"] = "Belgium", ["uk"] = "Бельгія", ["de"] = "Belgien", ["zh-CN"] = "比利时", ["zh-TW"] = "比利時", ["ja"] = "ベルギー", ["fa"] = "بلژیک" },
+        ["LU"] = new() { ["ru"] = "Люксембург", ["en"] = "Luxembourg", ["uk"] = "Люксембург", ["de"] = "Luxemburg", ["zh-CN"] = "卢森堡", ["zh-TW"] = "盧森堡", ["ja"] = "ルクセンブルク", ["fa"] = "لوکزامبورگ" },
+        ["HR"] = new() { ["ru"] = "Хорватия", ["en"] = "Croatia", ["uk"] = "Хорватія", ["de"] = "Kroatien", ["zh-CN"] = "克罗地亚", ["zh-TW"] = "克羅埃西亞", ["ja"] = "クロアチア", ["fa"] = "کرواسی" },
+        ["AL"] = new() { ["ru"] = "Албания", ["en"] = "Albania", ["uk"] = "Албанія", ["de"] = "Albanien", ["zh-CN"] = "阿尔巴尼亚", ["zh-TW"] = "阿爾巴尼亞", ["ja"] = "アルバニア", ["fa"] = "آلبانی" },
+        ["TH"] = new() { ["ru"] = "Таиланд", ["en"] = "Thailand", ["uk"] = "Таїланд", ["de"] = "Thailand", ["zh-CN"] = "泰国", ["zh-TW"] = "泰國", ["ja"] = "タイ", ["fa"] = "تایلند" },
+        ["VN"] = new() { ["ru"] = "Вьетнам", ["en"] = "Vietnam", ["uk"] = "В'єтнам", ["de"] = "Vietnam", ["zh-CN"] = "越南", ["zh-TW"] = "越南", ["ja"] = "ベトナム", ["fa"] = "ویتنام" },
+        ["ID"] = new() { ["ru"] = "Индонезия", ["en"] = "Indonesia", ["uk"] = "Індонезія", ["de"] = "Indonesien", ["zh-CN"] = "印度尼西亚", ["zh-TW"] = "印尼", ["ja"] = "インドネシア", ["fa"] = "اندونزی" },
+        ["MY"] = new() { ["ru"] = "Малайзия", ["en"] = "Malaysia", ["uk"] = "Малайзія", ["de"] = "Malaysia", ["zh-CN"] = "马来西亚", ["zh-TW"] = "馬來西亞", ["ja"] = "マレーシア", ["fa"] = "مالزی" },
+        ["PH"] = new() { ["ru"] = "Филиппины", ["en"] = "Philippines", ["uk"] = "Філіппіни", ["de"] = "Philippinen", ["zh-CN"] = "菲律宾", ["zh-TW"] = "菲律賓", ["ja"] = "フィリピン", ["fa"] = "فیلیپین" },
+        ["MX"] = new() { ["ru"] = "Мексика", ["en"] = "Mexico", ["uk"] = "Мексика", ["de"] = "Mexiko", ["zh-CN"] = "墨西哥", ["zh-TW"] = "墨西哥", ["ja"] = "メキシコ", ["fa"] = "مکزیک" },
+        ["AR"] = new() { ["ru"] = "Аргентина", ["en"] = "Argentina", ["uk"] = "Аргентина", ["de"] = "Argentinien", ["zh-CN"] = "阿根廷", ["zh-TW"] = "阿根廷", ["ja"] = "アルゼンチン", ["fa"] = "آرژانتین" },
+        ["CL"] = new() { ["ru"] = "Чили", ["en"] = "Chile", ["uk"] = "Чилі", ["de"] = "Chile", ["zh-CN"] = "智利", ["zh-TW"] = "智利", ["ja"] = "チリ", ["fa"] = "شیلی" },
+        ["ZA"] = new() { ["ru"] = "ЮАР", ["en"] = "South Africa", ["uk"] = "ПАР", ["de"] = "Südafrika", ["zh-CN"] = "南非", ["zh-TW"] = "南非", ["ja"] = "南アフリカ", ["fa"] = "آفریقای جنوبی" }
+    };
+
+    private static string LocalizeCountryName(string countryCode, string? apiCountryName)
+    {
+        if (!string.IsNullOrEmpty(countryCode))
+        {
+            string upper = countryCode.ToUpperInvariant();
+            if (_countryNames.TryGetValue(upper, out var map) && map.TryGetValue(CurrentLanguage, out var localized))
+                return localized;
+
+            try
+            {
+                var region = new RegionInfo(upper);
+                if (CurrentLanguage == "en") return region.EnglishName;
+                if (!string.IsNullOrWhiteSpace(apiCountryName)) return apiCountryName;
+                return region.EnglishName;
+            }
+            catch { }
+        }
+
+        return !string.IsNullOrWhiteSpace(apiCountryName) ? apiCountryName : L("UnknownLocation");
+    }
 
     public MainWindow()
     {
+        SystemProxyManager.DisableProxy();
+        KillOrphanedSingboxProcesses();
         Task.Run(() => { try { using var t = new TcpClient(); t.Connect("8.8.8.8", 53); } catch { } });
-
-        LoadSettings();
-
-        bool isAutoStart = Environment.GetCommandLineArgs().Contains("--autostart");
-        if (_currentSettings.StartMinimized && isAutoStart)
-        {
-            WindowState = WindowState.Minimized;
-            ShowInTaskbar = false;
-        }
 
         InitializeTrayIcon();
         InitializeComponent();
 
-        if (CmbLanguage != null)
+        Loaded += MainWindow_Loaded;
+    }
+
+    private void KillOrphanedSingboxProcesses()
+    {
+        try
         {
-            CmbLanguage.ItemsSource = new List<LanguageItem>
+            string expectedPath = Path.GetFullPath(Path.Combine(_exeDirectory, "sing-box.exe"));
+            foreach (var proc in Process.GetProcessesByName("sing-box"))
             {
-                new() { Name = "English", Code = "en" },
-                new() { Name = "Русский", Code = "ru" },
-                new() { Name = "Українська", Code = "uk" },
-                new() { Name = "Deutsch", Code = "de" },
-                new() { Name = "中文 (简体)", Code = "zh-Hans" },
-                new() { Name = "中文 (繁體)", Code = "zh-Hant" },
-                new() { Name = "日本語", Code = "ja" },
-                new() { Name = "فارسی", Code = "fa" }
-            };
+                try
+                {
+                    string? procPath = proc.MainModule?.FileName;
+                    if (!string.IsNullOrEmpty(procPath) &&
+                        string.Equals(Path.GetFullPath(procPath), expectedPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        proc.Kill(true);
+                        proc.WaitForExit(1500);
+                    }
+                }
+                catch { }
+                finally
+                {
+                    proc.Dispose();
+                }
+            }
+        }
+        catch { }
+    }
+
+    private static HashSet<string> GetExistingAdapterNames()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (!string.IsNullOrWhiteSpace(ni.Name))
+                    names.Add(ni.Name.Trim());
+            }
+        }
+        catch { }
+
+        try
+        {
+            using var netKey = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}");
+            if (netKey != null)
+            {
+                foreach (string subName in netKey.GetSubKeyNames())
+                {
+                    try
+                    {
+                        using var connKey = netKey.OpenSubKey($@"{subName}\Connection");
+                        if (connKey?.GetValue("Name") is string adapterName && !string.IsNullOrWhiteSpace(adapterName))
+                            names.Add(adapterName.Trim());
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch { }
+
+        return names;
+    }
+
+    private string SelectAvailableTunInterfaceName()
+    {
+        var existing = GetExistingAdapterNames();
+        if (!existing.Contains("NeonV") && !_blockedTunNames.Contains("NeonV"))
+            return "NeonV";
+
+        for (int i = 2; i <= 50; i++)
+        {
+            string candidate = $"NeonV-{i}";
+            if (!existing.Contains(candidate) && !_blockedTunNames.Contains(candidate))
+                return candidate;
         }
 
-        ApplyLanguage();
-        ApplyTheme(_currentSettings.Theme);
+        return $"NeonV-{Guid.NewGuid().ToString("N")[..4]}";
+    }
 
-        if (ListRoutingDomains != null) ListRoutingDomains.ItemsSource = RoutingDomainsList;
-        if (ListRoutingApps != null) ListRoutingApps.ItemsSource = RoutingAppsList;
-        if (LvProfiles != null) LvProfiles.ItemsSource = _profiles;
+    private static bool IsTunConflictError(string? errorText)
+    {
+        if (string.IsNullOrWhiteSpace(errorText)) return false;
+        return errorText.Contains("already exists", StringComparison.OrdinalIgnoreCase) ||
+               errorText.Contains("существует", StringComparison.OrdinalIgnoreCase) ||
+               errorText.Contains("існує", StringComparison.OrdinalIgnoreCase) ||
+               errorText.Contains("bereits vorhanden", StringComparison.OrdinalIgnoreCase) ||
+               errorText.Contains("configure tun interface", StringComparison.OrdinalIgnoreCase) ||
+               errorText.Contains("starting TUN interface", StringComparison.OrdinalIgnoreCase) ||
+               errorText.Contains("WintunCreateAdapter", StringComparison.OrdinalIgnoreCase) ||
+               errorText.Contains("create tun", StringComparison.OrdinalIgnoreCase);
+    }
 
-        ApplySettingsToUI();
-        UpdateButtonText();
-        UpdateEmptyState();
-
-        _pingTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
-        _pingTimer.Tick += (s, e) =>
+    private static bool CanBindTcpPort(IPAddress ip, int port)
+    {
+        try
         {
-            PingManager.Clear();
-            if (LvProfiles?.SelectedItem is VpnProfile selectedProfile) _ = selectedProfile.CheckPingAsync();
-        };
-        _pingTimer.Start();
-
-        _uptimeTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-        _uptimeTimer.Tick += (s, ev) =>
+            using var socket = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            socket.ExclusiveAddressUse = true;
+            socket.Bind(new IPEndPoint(ip, port));
+            return true;
+        }
+        catch
         {
-            if (!_isRunning) return;
-            if (TxtConnectionTime != null) TxtConnectionTime.Text = FormatUptime(DateTime.Now - _connectionStartTime, _currentSettings.Language);
-            UpdateTraffic();
-        };
+            return false;
+        }
+    }
 
-        _logTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
-        _logTimer.Tick += FlushLogs;
-        _logTimer.Start();
-
-        Loaded += async (s, e) =>
+    private static int FindFreeTcpPort(IPAddress ip)
+    {
+        try
         {
+            using var socket = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            socket.ExclusiveAddressUse = true;
+            socket.Bind(new IPEndPoint(ip, 0));
+            return ((IPEndPoint)socket.LocalEndPoint!).Port;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static string DetectSystemLanguage()
+    {
+        try
+        {
+            var culture = CultureInfo.CurrentUICulture;
+            string name = culture.Name;
+            string twoLetter = culture.TwoLetterISOLanguageName.ToLowerInvariant();
+
+            if (twoLetter == "zh")
+            {
+                if (name.Contains("TW", StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains("HK", StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains("MO", StringComparison.OrdinalIgnoreCase) ||
+                    name.Contains("Hant", StringComparison.OrdinalIgnoreCase))
+                {
+                    return "zh-TW";
+                }
+                return "zh-CN";
+            }
+
+            if (_translations.ContainsKey(twoLetter))
+                return twoLetter;
+        }
+        catch { }
+        return "en";
+    }
+
+    private static string GetSystemTheme()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            if (key?.GetValue("AppsUseLightTheme") is int i && i == 1) return "Light";
+        }
+        catch { }
+        return "Dark";
+    }
+
+    private void SystemEvents_UserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+    {
+        if (e.Category is UserPreferenceCategory.General or UserPreferenceCategory.Color or UserPreferenceCategory.VisualStyle)
+        {
+            if (_currentSettings.Theme == "System")
+            {
+                Dispatcher.InvokeAsync(() => ApplyTheme("System"));
+            }
+        }
+    }
+
+    private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            LoadSettings();
+            _lastAppliedAutoStart = _currentSettings.AutoStart;
+            ApplyTheme(_currentSettings.Theme);
+            ApplyLanguage(_currentSettings.Language);
+
+            SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
+
+            if (ListRoutingDomains != null) ListRoutingDomains.ItemsSource = RoutingDomainsList;
+            if (ListRoutingApps != null) ListRoutingApps.ItemsSource = RoutingAppsList;
+            if (LvProfiles != null) LvProfiles.ItemsSource = _standaloneProfiles;
+            if (LvSubscriptions != null) LvSubscriptions.ItemsSource = _subscriptions;
+
+            ApplySettingsToUI();
+            UpdateButtonText();
+            UpdateDynamicTexts();
+            UpdateEmptyState();
+
+            foreach (var p in _profiles) p.ForceUpdatePing();
+
+            _pingTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
+            _pingTimer.Tick += (s, ev) =>
+            {
+                PingManager.Clear();
+                if (ActiveProfile != null) _ = ActiveProfile.CheckPingAsync();
+            };
+            _pingTimer.Start();
+
+            _uptimeTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            _uptimeTimer.Tick += (s, ev) =>
+            {
+                if (!_isRunning) return;
+                if (TxtConnectionTime != null) TxtConnectionTime.Text = FormatUptime(DateTime.Now - _connectionStartTime);
+                UpdateTraffic();
+            };
+
+            _logTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+            _logTimer.Tick += FlushLogs;
+            _logTimer.Start();
+
             ApplyVisualEffects();
-            if (_currentSettings.StartMinimized && isAutoStart) Hide();
+
+            bool isAutoStart = Environment.GetCommandLineArgs().Contains("--autostart");
+            if (_currentSettings.StartMinimized && isAutoStart)
+            {
+                WindowState = WindowState.Minimized;
+                ShowInTaskbar = false;
+                Hide();
+            }
+
             UpdateMenuIndicator(BtnNavMain, 0);
 
-            if (_currentSettings.AutoConnect && isAutoStart && LvProfiles?.SelectedItem != null && !_isRunning)
+            if (_currentSettings.AutoUpdateSubscriptions && _subscriptions.Count > 0)
+                _ = AutoUpdateSubscriptionsOnStartupAsync();
+
+            if (_currentSettings.AutoConnect && isAutoStart && ActiveProfile != null && !_isRunning)
                 await StartVPNAsync();
-        };
+        }
+        catch { }
+    }
+
+    private async Task AutoUpdateSubscriptionsOnStartupAsync()
+    {
+        try
+        {
+            await Task.Delay(1500);
+            foreach (var sub in _subscriptions.ToList())
+            {
+                if (_isRealClose) break;
+                await UpdateSubscriptionAsync(sub, showNotify: false);
+            }
+        }
+        catch { }
+    }
+
+    private static string SanitizeHwid(string? raw)
+    {
+        if (!string.IsNullOrWhiteSpace(raw))
+        {
+            string cleaned = Regex.Replace(raw, @"[^a-zA-Z0-9=-]", "");
+            if (cleaned.Length > 64) cleaned = cleaned[..64];
+            if (cleaned.Length >= 10) return cleaned;
+        }
+        return Guid.NewGuid().ToString("N");
+    }
+
+    private static string GetOrCreateHwid()
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Cryptography");
+            if (key?.GetValue("MachineGuid") is string guid && !string.IsNullOrWhiteSpace(guid))
+            {
+                return SanitizeHwid(guid);
+            }
+        }
+        catch { }
+
+        return Guid.NewGuid().ToString("N");
+    }
+
+    private static bool IsAdministrator()
+    {
+        try
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch { return false; }
     }
 
     private void ComboBox_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
@@ -860,35 +3134,6 @@ public partial class MainWindow : Window
             e.Handled = true;
             parent.RaiseEvent(new MouseWheelEventArgs(e.MouseDevice, e.Timestamp, e.Delta) { RoutedEvent = MouseWheelEvent });
         }
-    }
-
-    private void ApplyLanguage()
-    {
-        var lang = _currentSettings.Language;
-        if (string.IsNullOrEmpty(lang) || !Locales.ContainsKey(lang)) lang = "en";
-
-        foreach (var kvp in Locales[lang])
-            Application.Current.Resources[kvp.Key] = kvp.Value;
-
-        if (AppInterfaceGrid != null)
-            AppInterfaceGrid.FlowDirection = lang == "fa" ? FlowDirection.RightToLeft : FlowDirection.LeftToRight;
-
-        if (TxtLangHint != null) TxtLangHint.Visibility = lang == "en" ? Visibility.Collapsed : Visibility.Visible;
-
-        if (_trayNavMainItem != null) _trayNavMainItem.Text = GetString("Lang_NavMain");
-        if (_trayNavSettingsItem != null) _trayNavSettingsItem.Text = GetString("Lang_NavSettings");
-        if (_trayNavLogsItem != null) _trayNavLogsItem.Text = GetString("Lang_NavLogs");
-        if (_trayExitItem != null) _trayExitItem.Text = GetString("Lang_TrayExit");
-
-        UpdateButtonText();
-        UpdateDynamicTexts();
-
-        foreach (var p in _profiles) p.ForceUpdatePing();
-
-        if (OverlayImport?.Visibility == Visibility.Visible && CmbProtocol?.SelectedItem is ComboBoxItem item)
-            UpdateManualFields(item.Content?.ToString() ?? "vless", true);
-
-        if (_isRunning && TxtLocation != null) _ = FetchLocationAsync(true);
     }
 
     private TimeSpan GetDuration(double seconds) =>
@@ -907,11 +3152,13 @@ public partial class MainWindow : Window
         contextMenu.Items.Add(_trayToggleItem);
         contextMenu.Items.Add(new Forms.ToolStripSeparator());
 
-        _trayNavMainItem = new Forms.ToolStripMenuItem(GetString("Lang_NavMain"), null, (_, _) => ShowTab(0));
-        _trayNavSettingsItem = new Forms.ToolStripMenuItem(GetString("Lang_NavSettings"), null, (_, _) => ShowTab(1));
-        _trayNavLogsItem = new Forms.ToolStripMenuItem(GetString("Lang_NavLogs"), null, (_, _) => ShowTab(2));
+        _trayNavMainItem = new Forms.ToolStripMenuItem("Главная", null, (_, _) => ShowTab(0));
+        _trayNavSubscriptionsItem = new Forms.ToolStripMenuItem("Подписки", null, (_, _) => ShowTab(1));
+        _trayNavSettingsItem = new Forms.ToolStripMenuItem("Настройки", null, (_, _) => ShowTab(2));
+        _trayNavLogsItem = new Forms.ToolStripMenuItem("Логи", null, (_, _) => ShowTab(3));
 
         contextMenu.Items.Add(_trayNavMainItem);
+        contextMenu.Items.Add(_trayNavSubscriptionsItem);
         contextMenu.Items.Add(_trayNavSettingsItem);
         contextMenu.Items.Add(_trayNavLogsItem);
         contextMenu.Items.Add(new Forms.ToolStripSeparator());
@@ -920,7 +3167,7 @@ public partial class MainWindow : Window
         contextMenu.Items.Add(_trayModeItem);
         contextMenu.Items.Add(new Forms.ToolStripSeparator());
 
-        _trayExitItem = new Forms.ToolStripMenuItem(GetString("Lang_TrayExit"), null, (_, _) => ExitApplication());
+        _trayExitItem = new Forms.ToolStripMenuItem("Выход", null, (_, _) => ExitApplication());
         contextMenu.Items.Add(_trayExitItem);
 
         _notifyIcon.ContextMenuStrip = contextMenu;
@@ -1028,8 +3275,9 @@ public partial class MainWindow : Window
             Activate();
 
             if (index == 0) BtnNavMain_Click(null!, null!);
-            else if (index == 1) BtnNavSettings_Click(null!, null!);
-            else if (index == 2) BtnNavLogs_Click(null!, null!);
+            else if (index == 1) BtnNavSubscriptions_Click(null!, null!);
+            else if (index == 2) BtnNavSettings_Click(null!, null!);
+            else if (index == 3) BtnNavLogs_Click(null!, null!);
         });
     }
 
@@ -1071,46 +3319,104 @@ public partial class MainWindow : Window
         if (sender is Grid grid) { grid.Focus(); Keyboard.ClearFocus(); }
     }
 
-    private static string Pluralize(int n, string unit, string lang)
+    private static string PluralizeSlavic(int n, string unit, bool isUkrainian)
     {
-        int form = 0;
-        if (lang is "ru" or "uk")
-        {
-            int m10 = n % 10, m100 = n % 100;
-            form = (m100 is >= 11 and <= 14) ? 2 : (m10 == 1) ? 0 : (m10 is >= 2 and <= 4) ? 1 : 2;
-        }
-        else if (lang is "en" or "de") form = n == 1 ? 0 : 1;
+        int m10 = n % 10, m100 = n % 100;
+        int form = (m100 is >= 11 and <= 14) ? 2 : (m10 == 1) ? 0 : (m10 is >= 2 and <= 4) ? 1 : 2;
 
-        return lang switch
+        if (isUkrainian)
         {
-            "ru" => unit switch { "month" => new[] { "месяц", "месяца", "месяцев" }[form], "day" => new[] { "день", "дня", "дней" }[form], "hour" => new[] { "час", "часа", "часов" }[form], "minute" => new[] { "минута", "минуты", "минут" }[form], _ => new[] { "секунда", "секунды", "секунд" }[form] },
-            "uk" => unit switch { "month" => new[] { "місяць", "місяці", "місяців" }[form], "day" => new[] { "день", "дні", "днів" }[form], "hour" => new[] { "година", "години", "годин" }[form], "minute" => new[] { "хвилина", "хвилини", "хвилин" }[form], _ => new[] { "секунда", "секунди", "секунд" }[form] },
-            "de" => unit switch { "month" => new[] { "Monat", "Monate" }[form], "day" => new[] { "Tag", "Tage" }[form], "hour" => new[] { "Stunde", "Stunden" }[form], "minute" => new[] { "Minute", "Minuten" }[form], _ => new[] { "Sekunde", "Sekunden" }[form] },
-            "zh-Hans" => unit switch { "month" => "月", "day" => "天", "hour" => "小时", "minute" => "分钟", _ => "秒" },
-            "zh-Hant" => unit switch { "month" => "月", "day" => "天", "hour" => "小時", "minute" => "分鐘", _ => "秒" },
-            "ja" => unit switch { "month" => "ヶ月", "day" => "日", "hour" => "時間", "minute" => "分", _ => "秒" },
-            "fa" => unit switch { "month" => "ماه", "day" => "روز", "hour" => "ساعت", "minute" => "دقیقه", _ => "ثانیه" },
-            _ => unit switch { "month" => new[] { "month", "months" }[form], "day" => new[] { "day", "days" }[form], "hour" => new[] { "hour", "hours" }[form], "minute" => new[] { "minute", "minutes" }[form], _ => new[] { "second", "seconds" }[form] }
+            return unit switch
+            {
+                "month" => new[] { "місяць", "місяці", "місяців" }[form],
+                "day" => new[] { "день", "дні", "днів" }[form],
+                "hour" => new[] { "година", "години", "годин" }[form],
+                "minute" => new[] { "хвилина", "хвилини", "хвилин" }[form],
+                _ => new[] { "секунда", "секунди", "секунд" }[form]
+            };
+        }
+
+        return unit switch
+        {
+            "month" => new[] { "месяц", "месяца", "месяцев" }[form],
+            "day" => new[] { "день", "дня", "дней" }[form],
+            "hour" => new[] { "час", "часа", "часов" }[form],
+            "minute" => new[] { "минута", "минуты", "минут" }[form],
+            _ => new[] { "секунда", "секунды", "секунд" }[form]
         };
     }
 
-    private static string FormatUptime(TimeSpan ts, string lang)
+    private static string FormatUptimeUnit(int n, string unit)
     {
-        if (string.IsNullOrEmpty(lang)) lang = "en";
+        return CurrentLanguage switch
+        {
+            "ru" => $"{n} {PluralizeSlavic(n, unit, false)}",
+            "uk" => $"{n} {PluralizeSlavic(n, unit, true)}",
+            "de" => unit switch
+            {
+                "month" => $"{n} {(n == 1 ? "Monat" : "Monate")}",
+                "day" => $"{n} {(n == 1 ? "Tag" : "Tage")}",
+                "hour" => $"{n} {(n == 1 ? "Stunde" : "Stunden")}",
+                "minute" => $"{n} {(n == 1 ? "Minute" : "Minuten")}",
+                _ => $"{n} {(n == 1 ? "Sekunde" : "Sekunden")}"
+            },
+            "zh-CN" => unit switch
+            {
+                "month" => $"{n} 个月",
+                "day" => $"{n} 天",
+                "hour" => $"{n} 小时",
+                "minute" => $"{n} 分钟",
+                _ => $"{n} 秒"
+            },
+            "zh-TW" => unit switch
+            {
+                "month" => $"{n} 個月",
+                "day" => $"{n} 天",
+                "hour" => $"{n} 小時",
+                "minute" => $"{n} 分鐘",
+                _ => $"{n} 秒"
+            },
+            "ja" => unit switch
+            {
+                "month" => $"{n}ヶ月",
+                "day" => $"{n}日",
+                "hour" => $"{n}時間",
+                "minute" => $"{n}分",
+                _ => $"{n}秒"
+            },
+            "fa" => unit switch
+            {
+                "month" => $"{n} ماه",
+                "day" => $"{n} روز",
+                "hour" => $"{n} ساعت",
+                "minute" => $"{n} دقیقه",
+                _ => $"{n} ثانیه"
+            },
+            _ => unit switch
+            {
+                "month" => $"{n} {(n == 1 ? "month" : "months")}",
+                "day" => $"{n} {(n == 1 ? "day" : "days")}",
+                "hour" => $"{n} {(n == 1 ? "hour" : "hours")}",
+                "minute" => $"{n} {(n == 1 ? "minute" : "minutes")}",
+                _ => $"{n} {(n == 1 ? "second" : "seconds")}"
+            }
+        };
+    }
 
+    private static string FormatUptime(TimeSpan ts)
+    {
         int totalMonths = (int)(ts.TotalDays / 30);
-        if (totalMonths > 0) return $"{totalMonths} {Pluralize(totalMonths, "month", lang)}";
-
-        if (ts.Days > 0) return $"{ts.Days} {Pluralize(ts.Days, "day", lang)}";
-        if (ts.Hours > 0) return $"{ts.Hours} {Pluralize(ts.Hours, "hour", lang)}";
-        if (ts.Minutes > 0) return $"{ts.Minutes} {Pluralize(ts.Minutes, "minute", lang)}";
-
-        return $"{ts.Seconds} {Pluralize(ts.Seconds, "second", lang)}";
+        if (totalMonths > 0) return FormatUptimeUnit(totalMonths, "month");
+        if (ts.Days > 0) return FormatUptimeUnit(ts.Days, "day");
+        if (ts.Hours > 0) return FormatUptimeUnit(ts.Hours, "hour");
+        if (ts.Minutes > 0) return FormatUptimeUnit(ts.Minutes, "minute");
+        return FormatUptimeUnit(ts.Seconds, "second");
     }
 
     private void ApplyTheme(string theme)
     {
-        IsDarkTheme = theme == "Dark";
+        string resolvedTheme = theme == "System" ? GetSystemTheme() : theme;
+        IsDarkTheme = resolvedTheme != "Light";
         Resources["ToggleBtnBgColor"] = new SolidColorBrush(Color.FromRgb(103, 80, 164));
         Resources["ErrorColor"] = new SolidColorBrush(IsDarkTheme ? Color.FromRgb(248, 113, 113) : Color.FromRgb(220, 38, 38));
 
@@ -1142,10 +3448,12 @@ public partial class MainWindow : Window
         if (IsLoaded && FindResource("TextMutedColor") is Brush mutedBrush && FindResource("AccentColor") is Brush accentBrush)
         {
             if (BtnNavMain != null) BtnNavMain.Foreground = mutedBrush;
+            if (BtnNavSubscriptions != null) BtnNavSubscriptions.Foreground = mutedBrush;
             if (BtnNavSettings != null) BtnNavSettings.Foreground = mutedBrush;
             if (BtnNavLogs != null) BtnNavLogs.Foreground = mutedBrush;
 
             if (ViewMain?.Visibility == Visibility.Visible && BtnNavMain != null) BtnNavMain.Foreground = accentBrush;
+            else if (ViewSubscriptions?.Visibility == Visibility.Visible && BtnNavSubscriptions != null) BtnNavSubscriptions.Foreground = accentBrush;
             else if (ViewSettings?.Visibility == Visibility.Visible && BtnNavSettings != null) BtnNavSettings.Foreground = accentBrush;
             else if (BtnNavLogs != null) BtnNavLogs.Foreground = accentBrush;
         }
@@ -1157,72 +3465,392 @@ public partial class MainWindow : Window
         ApplyVisualEffects();
     }
 
+    private void ApplyLanguage(string lang)
+    {
+        if (string.IsNullOrWhiteSpace(lang) || !_translations.ContainsKey(lang))
+            lang = "en";
+
+        _currentSettings.Language = lang;
+        CurrentLanguage = lang;
+
+        if (TxtNavMain != null) TxtNavMain.Text = L("NavMain");
+        if (TxtNavSubs != null) TxtNavSubs.Text = L("NavSubs");
+        if (TxtNavSettings != null) TxtNavSettings.Text = L("NavSettings");
+        if (TxtNavLogs != null) TxtNavLogs.Text = L("NavLogs");
+
+        if (TxtModeLabel != null) TxtModeLabel.Text = L("ModeLabel");
+        if (TxtBtnAddProfile != null) TxtBtnAddProfile.Text = L("BtnAddProfile");
+        if (TxtBtnRefreshPing != null) TxtBtnRefreshPing.Text = L("BtnRefreshPing");
+        if (TxtSearchPlaceholder != null) TxtSearchPlaceholder.Text = L("SearchPlaceholder");
+        if (TxtEmptyProfilesTitle != null) TxtEmptyProfilesTitle.Text = L("EmptyProfilesTitle");
+        if (TxtEmptyProfilesDesc != null) TxtEmptyProfilesDesc.Text = L("EmptyProfilesDesc");
+
+        if (TxtBtnAddSub != null) TxtBtnAddSub.Text = L("BtnAddSub");
+        if (TxtBtnUpdateAllSubs != null) TxtBtnUpdateAllSubs.Text = L("BtnUpdateAllSubs");
+        if (TxtEmptySubsTitle != null) TxtEmptySubsTitle.Text = L("EmptySubsTitle");
+        if (TxtEmptySubsDesc != null) TxtEmptySubsDesc.Text = L("EmptySubsDesc");
+
+        if (TxtSettingsTitle != null) TxtSettingsTitle.Text = L("SettingsTitle");
+        if (TxtGroupLaunch != null) TxtGroupLaunch.Text = L("GroupLaunch");
+        if (ChkAutoStart != null) ChkAutoStart.Content = L("AutoStart");
+        if (ChkStartMinimized != null) ChkStartMinimized.Content = L("StartMinimized");
+        if (ChkMinimizeToTray != null) ChkMinimizeToTray.Content = L("MinimizeToTray");
+        if (ChkAutoUpdateSubs != null) ChkAutoUpdateSubs.Content = L("AutoUpdateSubs");
+        if (ChkUseCustomConfig != null) ChkUseCustomConfig.Content = L("CustomConfig");
+
+        if (TxtGroupAppearance != null) TxtGroupAppearance.Text = L("GroupAppearance");
+        if (TxtLangLabel != null) TxtLangLabel.Text = L("LangLabel");
+        if (TxtThemeLabel != null) TxtThemeLabel.Text = L("ThemeLabel");
+        if (CmbTheme != null && CmbTheme.Items.Count >= 3)
+        {
+            ((ComboBoxItem)CmbTheme.Items[0]).Content = L("ThemeSystem");
+            ((ComboBoxItem)CmbTheme.Items[1]).Content = L("ThemeDark");
+            ((ComboBoxItem)CmbTheme.Items[2]).Content = L("ThemeLight");
+        }
+        if (ChkVisualEffects != null) ChkVisualEffects.Content = L("VisualEffects");
+        if (ChkDisableAnimations != null) ChkDisableAnimations.Content = L("DisableAnimations");
+
+        if (TxtGroupNetwork != null) TxtGroupNetwork.Text = L("GroupNetwork");
+        if (TxtDnsLabel != null) TxtDnsLabel.Text = L("DnsLabel");
+        if (TxtDirectDnsLabel != null) TxtDirectDnsLabel.Text = L("DirectDnsLabel");
+        if (TxtBtnRouting != null) TxtBtnRouting.Text = L("BtnRouting");
+
+        if (TxtGroupAdvanced != null) TxtGroupAdvanced.Text = L("GroupAdvanced");
+        if (TxtProxyPortLabel != null) TxtProxyPortLabel.Text = L("ProxyPortLabel");
+        if (TxtTunStackLabel != null) TxtTunStackLabel.Text = L("TunStackLabel");
+        if (ChkStrictRoute != null) ChkStrictRoute.Content = L("StrictRoute");
+        if (ChkEnableIpv6 != null) ChkEnableIpv6.Content = L("EnableIpv6");
+        if (ChkAllowLan != null) ChkAllowLan.Content = L("AllowLan");
+        if (TxtAllowLanDesc != null) TxtAllowLanDesc.Text = L("AllowLanDesc");
+
+        if (TxtLogsTitle != null) TxtLogsTitle.Text = L("LogsTitle");
+        if (TxtLogLevelLabel != null) TxtLogLevelLabel.Text = L("LogLevelLabel");
+        if (ChkAutoScroll != null) ChkAutoScroll.Content = L("AutoScroll");
+        if (BtnCopyLogs != null) BtnCopyLogs.Content = L("BtnCopyLogs");
+        if (BtnClearLogs != null) BtnClearLogs.Content = L("BtnClearLogs");
+
+        if (TxtImportTitle != null) TxtImportTitle.Text = _editingProfile != null ? L("EditTitle") : L("ImportTitle");
+        if (BtnPasteImport != null) BtnPasteImport.Content = L("PasteImport");
+        if (TxtOrManual != null) TxtOrManual.Text = L("OrManual");
+        if (TxtProtocolLabel != null) TxtProtocolLabel.Text = L("ProtocolLabel");
+        if (BtnCancelImport != null) BtnCancelImport.Content = L("Cancel");
+        if (BtnSaveImport != null) BtnSaveImport.Content = L("Save");
+
+        if (TxtAddSubTitle != null) TxtAddSubTitle.Text = L("AddSubTitle");
+        if (TxtSubNameLabel != null) TxtSubNameLabel.Text = L("SubNameLabel");
+        if (TxtSubUrlLabel != null) TxtSubUrlLabel.Text = L("SubUrlLabel");
+        if (BtnCancelSub != null) BtnCancelSub.Content = L("Cancel");
+        if (BtnSaveSub != null) BtnSaveSub.Content = L("Add");
+
+        if (TxtRoutingTitle != null) TxtRoutingTitle.Text = L("RoutingTitle");
+        if (ChkBypassRu != null) ChkBypassRu.Content = L("BypassRu");
+        if (TxtRouteModeLabel != null) TxtRouteModeLabel.Text = L("RouteModeLabel");
+        if (CmbRouteMode != null && CmbRouteMode.Items.Count >= 2)
+        {
+            ((ComboBoxItem)CmbRouteMode.Items[0]).Content = L("RouteModeBypass");
+            ((ComboBoxItem)CmbRouteMode.Items[1]).Content = L("RouteModeOnly");
+        }
+        if (TxtDomainsLabel != null) TxtDomainsLabel.Text = L("DomainsLabel");
+        if (BtnAddDomain != null) BtnAddDomain.Content = L("Add");
+        if (TxtAppsLabel != null) TxtAppsLabel.Text = L("AppsLabel");
+        if (BtnAddApp != null) BtnAddApp.Content = L("Add");
+        if (BtnCloseRouting != null) BtnCloseRouting.Content = L("Done");
+
+        if (TxtQRTitle != null) TxtQRTitle.Text = L("QRTitle");
+        if (BtnCopyLinkFromQR != null) BtnCopyLinkFromQR.Content = L("CopyLink");
+
+        if (FindResource("RowContextMenu") is ContextMenu rowMenu)
+        {
+            foreach (var item in rowMenu.Items)
+            {
+                if (item is MenuItem mi && mi.Tag is string tag)
+                {
+                    mi.Header = L(tag);
+                }
+            }
+        }
+
+        if (_trayNavMainItem != null) _trayNavMainItem.Text = L("NavMain");
+        if (_trayNavSubscriptionsItem != null) _trayNavSubscriptionsItem.Text = L("NavSubs");
+        if (_trayNavSettingsItem != null) _trayNavSettingsItem.Text = L("NavSettings");
+        if (_trayNavLogsItem != null) _trayNavLogsItem.Text = L("NavLogs");
+        if (_trayExitItem != null) _trayExitItem.Text = L("TrayExit");
+
+        foreach (var sub in _subscriptions) sub.NotifyTexts();
+        foreach (var p in _profiles) p.ForceUpdatePing();
+
+        if (_isRunning)
+        {
+            if (TxtLocation != null && TxtLocation.Text != "...")
+                TxtLocation.Text = LocalizeCountryName(_lastLocationCountryCode, _lastLocationApiName);
+            if (TxtConnectionTime != null && TxtConnectionTime.Text != "...")
+                TxtConnectionTime.Text = FormatUptime(DateTime.Now - _connectionStartTime);
+        }
+
+        UpdateButtonText();
+        UpdateDynamicTexts();
+    }
+
     private void ApplyVisualEffects()
     {
+        bool enabled = _currentSettings.EnableVisualEffects;
+        Color accentColor = TryFindResource("AccentColor") is SolidColorBrush accent
+            ? accent.Color
+            : Color.FromRgb(208, 188, 255);
+
+        Resources["VisualEffectGlowOpacity"] = enabled ? (IsDarkTheme ? 0.55 : 0.30) : 0.0;
+
+        if (AmbientGlowOverlay != null)
+        {
+            if (enabled)
+            {
+                byte a1 = (byte)(IsDarkTheme ? 42 : 28);
+                byte a2 = (byte)(IsDarkTheme ? 14 : 9);
+                if (AmbientGlowTop != null)
+                {
+                    AmbientGlowTop.Fill = new RadialGradientBrush(new GradientStopCollection
+                    {
+                        new GradientStop(Color.FromArgb(a1, accentColor.R, accentColor.G, accentColor.B), 0.0),
+                        new GradientStop(Color.FromArgb(a2, accentColor.R, accentColor.G, accentColor.B), 0.55),
+                        new GradientStop(Color.FromArgb(0, accentColor.R, accentColor.G, accentColor.B), 1.0)
+                    });
+                }
+                if (AmbientGlowBottom != null)
+                {
+                    AmbientGlowBottom.Fill = new RadialGradientBrush(new GradientStopCollection
+                    {
+                        new GradientStop(Color.FromArgb((byte)(a1 * 0.7), accentColor.R, accentColor.G, accentColor.B), 0.0),
+                        new GradientStop(Color.FromArgb(0, accentColor.R, accentColor.G, accentColor.B), 1.0)
+                    });
+                }
+            }
+
+            double targetOpacity = enabled ? 1.0 : 0.0;
+            if (IsLoaded)
+            {
+                AmbientGlowOverlay.BeginAnimation(OpacityProperty, new DoubleAnimation
+                {
+                    To = targetOpacity,
+                    Duration = GetDuration(0.35),
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                });
+            }
+            else
+            {
+                AmbientGlowOverlay.Opacity = targetOpacity;
+            }
+        }
+
+        if (TxtAppTitle != null)
+        {
+            TxtAppTitle.Effect = enabled
+                ? new DropShadowEffect
+                {
+                    Color = accentColor,
+                    BlurRadius = 16,
+                    ShadowDepth = 0,
+                    Opacity = IsDarkTheme ? 0.55 : 0.25
+                }
+                : null;
+        }
+
+        if (SidebarShadowBorder != null)
+        {
+            SidebarShadowBorder.Effect = new DropShadowEffect
+            {
+                BlurRadius = enabled ? 28 : 20,
+                Opacity = enabled ? (IsDarkTheme ? 0.45 : 0.22) : 0.15,
+                ShadowDepth = 0,
+                Direction = 0
+            };
+        }
+
         if (BtnToggle != null)
         {
-            if (_currentSettings.EnableVisualEffects && FindResource("AccentColor") is SolidColorBrush accent)
+            if (enabled)
             {
-                BtnToggle.Effect = new DropShadowEffect
+                Color toggleGlowColor = _isRunning ? Color.FromRgb(179, 38, 30) : accentColor;
+                double baseOpacity = IsDarkTheme ? 0.6 : 0.3;
+                var effect = new DropShadowEffect
                 {
-                    Color = _isRunning ? Color.FromRgb(179, 38, 30) : accent.Color,
+                    Color = toggleGlowColor,
                     BlurRadius = 25,
                     ShadowDepth = 0,
-                    Opacity = IsDarkTheme ? 0.6 : 0.3
+                    Opacity = baseOpacity
                 };
+                BtnToggle.Effect = effect;
+
+                if (_isRunning && !_currentSettings.DisableAnimations)
+                {
+                    var pulseEase = new SineEase { EasingMode = EasingMode.EaseInOut };
+                    effect.BeginAnimation(DropShadowEffect.BlurRadiusProperty, new DoubleAnimation
+                    {
+                        From = 20,
+                        To = 34,
+                        Duration = TimeSpan.FromSeconds(1.8),
+                        AutoReverse = true,
+                        RepeatBehavior = RepeatBehavior.Forever,
+                        EasingFunction = pulseEase
+                    });
+                    effect.BeginAnimation(DropShadowEffect.OpacityProperty, new DoubleAnimation
+                    {
+                        From = IsDarkTheme ? 0.45 : 0.25,
+                        To = IsDarkTheme ? 0.85 : 0.48,
+                        Duration = TimeSpan.FromSeconds(1.8),
+                        AutoReverse = true,
+                        RepeatBehavior = RepeatBehavior.Forever,
+                        EasingFunction = pulseEase
+                    });
+                }
             }
-            else BtnToggle.Effect = null;
+            else
+            {
+                BtnToggle.Effect = null;
+            }
         }
 
         if (MenuIndicator != null)
         {
-            if (_currentSettings.EnableVisualEffects && FindResource("AccentColor") is SolidColorBrush accent)
-            {
-                MenuIndicator.Effect = new DropShadowEffect
+            MenuIndicator.Effect = enabled
+                ? new DropShadowEffect
                 {
-                    Color = accent.Color,
-                    BlurRadius = 8,
+                    Color = accentColor,
+                    BlurRadius = 10,
                     ShadowDepth = 0,
                     Opacity = IsDarkTheme ? 0.9 : 0.5
-                };
+                }
+                : null;
+        }
+
+        if (BtnAddProfile != null)
+        {
+            BtnAddProfile.Effect = enabled
+                ? new DropShadowEffect
+                {
+                    Color = accentColor,
+                    BlurRadius = 16,
+                    ShadowDepth = 0,
+                    Opacity = IsDarkTheme ? 0.45 : 0.25
+                }
+                : null;
+        }
+
+        if (BtnAddSub != null)
+        {
+            BtnAddSub.Effect = enabled
+                ? new DropShadowEffect
+                {
+                    Color = accentColor,
+                    BlurRadius = 16,
+                    ShadowDepth = 0,
+                    Opacity = IsDarkTheme ? 0.45 : 0.25
+                }
+                : null;
+        }
+
+        if (SettingsCardShadow != null)
+        {
+            SettingsCardShadow.Opacity = enabled ? 1.0 : 0.0;
+            SettingsCardShadow.Effect = enabled
+                ? new DropShadowEffect
+                {
+                    Color = Colors.Black,
+                    BlurRadius = 18,
+                    ShadowDepth = 3,
+                    Opacity = IsDarkTheme ? 0.35 : 0.14
+                }
+                : null;
+        }
+
+        if (LogsConsoleShadow != null)
+        {
+            LogsConsoleShadow.Opacity = enabled ? 1.0 : 0.0;
+            LogsConsoleShadow.Effect = enabled
+                ? new DropShadowEffect
+                {
+                    Color = Colors.Black,
+                    BlurRadius = 18,
+                    ShadowDepth = 3,
+                    Opacity = IsDarkTheme ? 0.4 : 0.16
+                }
+                : null;
+        }
+
+        if (LocationBadge != null)
+        {
+            if (enabled)
+            {
+                LocationBadge.Background = TryFindResource("PanelColor") as Brush ?? Brushes.Transparent;
+                LocationBadge.BorderThickness = new Thickness(1);
+                LocationBadge.BorderBrush = new SolidColorBrush(Color.FromArgb((byte)(IsDarkTheme ? 95 : 70), accentColor.R, accentColor.G, accentColor.B));
             }
-            else MenuIndicator.Effect = null;
+            else
+            {
+                LocationBadge.Background = Brushes.Transparent;
+                LocationBadge.BorderThickness = new Thickness(0);
+                LocationBadge.BorderBrush = null;
+            }
         }
     }
 
     private void LoadSettings()
     {
-        bool isFirstLaunch = !File.Exists(Path.Combine(_baseDirectory, "settings.json"));
+        string settingsPath = Path.Combine(_exeDirectory, "settings.json");
+
+        bool isFirstLaunch = !File.Exists(settingsPath);
 
         try
         {
             if (!isFirstLaunch)
             {
-                string json = File.ReadAllText(Path.Combine(_baseDirectory, "settings.json"));
+                string json = File.ReadAllText(settingsPath);
                 if (JsonSerializer.Deserialize<AppSettings>(json) is { } saved) _currentSettings = saved;
             }
         }
         catch { }
 
-        if (isFirstLaunch)
-        {
-            try
-            {
-                using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
-                if (key?.GetValue("AppsUseLightTheme") is int i && i == 1) _currentSettings.Theme = "Light";
-            }
-            catch { }
+        _currentSettings.Hwid = string.IsNullOrWhiteSpace(_currentSettings.Hwid)
+            ? GetOrCreateHwid()
+            : SanitizeHwid(_currentSettings.Hwid);
 
-            var lang = System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName;
-            _currentSettings.Language = new[] { "ru", "uk", "en", "zh", "de", "ja", "fa" }.Contains(lang) ? lang : "en";
-            if (lang == "zh") _currentSettings.Language = System.Globalization.CultureInfo.CurrentUICulture.Name.Contains("Hant") ? "zh-Hant" : "zh-Hans";
+        if (isFirstLaunch || string.IsNullOrWhiteSpace(_currentSettings.Language) || !_translations.ContainsKey(_currentSettings.Language))
+        {
+            _currentSettings.Language = DetectSystemLanguage();
         }
 
+        if (isFirstLaunch || (_currentSettings.Theme is not ("System" or "Dark" or "Light")))
+        {
+            _currentSettings.Theme = "System";
+        }
+
+        if (string.IsNullOrWhiteSpace(_currentSettings.RemoteDns)) _currentSettings.RemoteDns = "8.8.8.8";
+        if (string.IsNullOrWhiteSpace(_currentSettings.DirectDns)) _currentSettings.DirectDns = "77.88.8.8";
+        if (_currentSettings.ProxyPort <= 0 || _currentSettings.ProxyPort > 65535) _currentSettings.ProxyPort = 2080;
+
+        _profiles.Clear();
+        _standaloneProfiles.Clear();
         foreach (var p in _currentSettings.Profiles)
         {
             if (string.IsNullOrEmpty(p.Address) && !string.IsNullOrEmpty(p.Link)) ParseLinkIntoProfile(p, p.Link);
             _profiles.Add(p);
+            if (string.IsNullOrEmpty(p.SubscriptionId)) _standaloneProfiles.Add(p);
             _ = p.CheckPingAsync();
+        }
+
+        _subscriptions.Clear();
+        foreach (var s in _currentSettings.Subscriptions)
+        {
+            s.Profiles.Clear();
+            foreach (var sp in _profiles.Where(p => p.SubscriptionId == s.Id))
+            {
+                s.Profiles.Add(sp);
+            }
+            _subscriptions.Add(s);
+        }
+
+        if (_currentSettings.SelectedProfileIndex >= 0 && _currentSettings.SelectedProfileIndex < _profiles.Count)
+        {
+            ActiveProfile = _profiles[_currentSettings.SelectedProfileIndex];
         }
 
         RoutingDomainsList.Clear();
@@ -1236,28 +3864,43 @@ public partial class MainWindow : Window
     {
         _isUpdatingSettings = true;
 
-        if (_currentSettings.SelectedProfileIndex >= 0 && _currentSettings.SelectedProfileIndex < _profiles.Count && LvProfiles != null)
-            LvProfiles.SelectedIndex = _currentSettings.SelectedProfileIndex;
+        if (ActiveProfile != null && string.IsNullOrEmpty(ActiveProfile.SubscriptionId) && LvProfiles != null)
+        {
+            LvProfiles.SelectedItem = ActiveProfile;
+        }
+
+        if (CmbLanguage != null)
+        {
+            var targetTag = string.IsNullOrEmpty(_currentSettings.Language) ? "en" : _currentSettings.Language;
+            CmbLanguage.SelectedItem = CmbLanguage.Items.Cast<ComboBoxItem>().FirstOrDefault(i => (string?)i.Tag == targetTag) ?? CmbLanguage.Items[0];
+        }
 
         if (TxtDns != null) TxtDns.Text = _currentSettings.RemoteDns;
+        if (TxtDirectDns != null) TxtDirectDns.Text = _currentSettings.DirectDns;
         if (ChkAutoStart != null) ChkAutoStart.IsChecked = _currentSettings.AutoStart;
         if (ChkAutoConnect != null) ChkAutoConnect.IsChecked = _currentSettings.AutoConnect;
         if (ChkStartMinimized != null) ChkStartMinimized.IsChecked = _currentSettings.StartMinimized;
+        if (ChkMinimizeToTray != null) ChkMinimizeToTray.IsChecked = _currentSettings.MinimizeToTray;
+        if (ChkAutoUpdateSubs != null) ChkAutoUpdateSubs.IsChecked = _currentSettings.AutoUpdateSubscriptions;
         if (ChkUseCustomConfig != null) ChkUseCustomConfig.IsChecked = _currentSettings.UseCustomConfig;
         if (ChkVisualEffects != null) ChkVisualEffects.IsChecked = _currentSettings.EnableVisualEffects;
         if (ChkDisableAnimations != null) ChkDisableAnimations.IsChecked = _currentSettings.DisableAnimations;
-        if (CmbTheme != null) CmbTheme.SelectedIndex = _currentSettings.Theme == "Light" ? 1 : 0;
+        if (CmbTheme != null)
+        {
+            var themeTag = string.IsNullOrEmpty(_currentSettings.Theme) ? "System" : _currentSettings.Theme;
+            CmbTheme.SelectedItem = CmbTheme.Items.Cast<ComboBoxItem>().FirstOrDefault(i => (string?)i.Tag == themeTag) ?? CmbTheme.Items[0];
+        }
         if (CmbMode != null) CmbMode.SelectedIndex = _currentSettings.Mode == "Proxy" ? 1 : 0;
         if (TxtProxyPort != null) TxtProxyPort.Text = _currentSettings.ProxyPort.ToString();
+        if (ChkStrictRoute != null) ChkStrictRoute.IsChecked = _currentSettings.StrictRoute;
+        if (ChkEnableIpv6 != null) ChkEnableIpv6.IsChecked = _currentSettings.EnableIpv6;
         if (ChkAllowLan != null) ChkAllowLan.IsChecked = _currentSettings.AllowLan;
 
         if (CmbTunStack != null)
-            CmbTunStack.SelectedItem = CmbTunStack.Items.Cast<ComboBoxItem>().FirstOrDefault(i => (string?)i.Tag == _currentSettings.TunStack);
+            CmbTunStack.SelectedItem = CmbTunStack.Items.Cast<ComboBoxItem>().FirstOrDefault(i => (string?)i.Tag == _currentSettings.TunStack) ?? CmbTunStack.Items[0];
 
         if (CmbLogLevel != null)
-            CmbLogLevel.SelectedItem = CmbLogLevel.Items.Cast<ComboBoxItem>().FirstOrDefault(i => (string?)i.Tag == _currentSettings.LogLevel);
-
-        if (CmbLanguage != null) CmbLanguage.SelectedValue = _currentSettings.Language;
+            CmbLogLevel.SelectedItem = CmbLogLevel.Items.Cast<ComboBoxItem>().FirstOrDefault(i => (string?)i.Tag == _currentSettings.LogLevel) ?? CmbLogLevel.Items[0];
 
         _isUpdatingSettings = false;
         UpdateDynamicTexts();
@@ -1266,101 +3909,149 @@ public partial class MainWindow : Window
     private void UpdateEmptyState()
     {
         if (EmptyStatePanel != null)
-            EmptyStatePanel.Visibility = _profiles.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+            EmptyStatePanel.Visibility = _standaloneProfiles.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        if (EmptySubscriptionsPanel != null)
+            EmptySubscriptionsPanel.Visibility = _subscriptions.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private string GetTrayModeText()
     {
-        string prefix = _currentSettings.Language switch
-        {
-            "ru" => "Режим",
-            "uk" => "Режим",
-            "de" => "Modus",
-            "zh-Hans" or "zh-Hant" => "模式",
-            "ja" => "モード",
-            "fa" => "حالت",
-            _ => "Mode"
-        };
-        return $"{prefix}: {_currentSettings.Mode}";
+        return string.Format(L("TrayModeFmt"), _currentSettings.Mode);
     }
 
     private void UpdateDynamicTexts()
     {
         if (ChkAutoConnect != null)
-            ChkAutoConnect.Content = GetString(_currentSettings.Mode == "Proxy" ? "Lang_AutoConnectProxy" : "Lang_AutoConnectVpn");
+        {
+            bool isProxy = _currentSettings.Mode == "Proxy";
+            ChkAutoConnect.Content = isProxy ? L("AutoConnectProxy") : L("AutoConnectVpn");
+        }
 
         if (_trayModeItem != null)
             _trayModeItem.Text = GetTrayModeText();
     }
 
-    private void SaveSettings()
+    private void SyncSettingsFromUI()
     {
-        if (_isUpdatingSettings) return;
+        _currentSettings.Profiles = _profiles.ToList();
+        _currentSettings.Subscriptions = _subscriptions.ToList();
+        _currentSettings.SelectedProfileIndex = ActiveProfile != null ? _profiles.IndexOf(ActiveProfile) : -1;
+
+        if (CmbTheme?.SelectedItem is ComboBoxItem thItem && thItem.Tag != null) _currentSettings.Theme = thItem.Tag.ToString() ?? "System";
+        if (CmbMode != null) _currentSettings.Mode = CmbMode.SelectedIndex == 1 ? "Proxy" : "TUN";
+        if (TxtDns != null) _currentSettings.RemoteDns = string.IsNullOrWhiteSpace(TxtDns.Text) ? "8.8.8.8" : TxtDns.Text.Trim();
+        if (TxtDirectDns != null) _currentSettings.DirectDns = string.IsNullOrWhiteSpace(TxtDirectDns.Text) ? "77.88.8.8" : TxtDirectDns.Text.Trim();
+
+        if (ChkAutoStart != null) _currentSettings.AutoStart = ChkAutoStart.IsChecked ?? false;
+        if (ChkAutoConnect != null) _currentSettings.AutoConnect = ChkAutoConnect.IsChecked ?? false;
+        if (ChkStartMinimized != null) _currentSettings.StartMinimized = ChkStartMinimized.IsChecked ?? false;
+        if (ChkMinimizeToTray != null) _currentSettings.MinimizeToTray = ChkMinimizeToTray.IsChecked ?? true;
+        if (ChkAutoUpdateSubs != null) _currentSettings.AutoUpdateSubscriptions = ChkAutoUpdateSubs.IsChecked ?? true;
+        if (ChkUseCustomConfig != null) _currentSettings.UseCustomConfig = ChkUseCustomConfig.IsChecked ?? false;
+
+        if (ChkVisualEffects != null) _currentSettings.EnableVisualEffects = ChkVisualEffects.IsChecked ?? false;
+        if (ChkDisableAnimations != null) _currentSettings.DisableAnimations = ChkDisableAnimations.IsChecked ?? false;
+
+        if (TxtProxyPort != null && int.TryParse(TxtProxyPort.Text, out int port) && port is >= 1 and <= 65535) _currentSettings.ProxyPort = port;
+        if (ChkStrictRoute != null) _currentSettings.StrictRoute = ChkStrictRoute.IsChecked ?? true;
+        if (ChkEnableIpv6 != null) _currentSettings.EnableIpv6 = ChkEnableIpv6.IsChecked ?? false;
+        if (ChkAllowLan != null) _currentSettings.AllowLan = ChkAllowLan.IsChecked ?? false;
+
+        if (CmbTunStack?.SelectedItem is ComboBoxItem tsItem && tsItem.Tag != null) _currentSettings.TunStack = tsItem.Tag.ToString() ?? "system";
+        if (CmbLogLevel?.SelectedItem is ComboBoxItem llItem && llItem.Tag != null) _currentSettings.LogLevel = llItem.Tag.ToString() ?? "info";
+    }
+
+    private void FlushSaveSettingsSync()
+    {
         try
         {
-            _currentSettings.Profiles = _profiles.ToList();
-            if (LvProfiles != null) _currentSettings.SelectedProfileIndex = LvProfiles.SelectedIndex;
-            if (CmbTheme != null) _currentSettings.Theme = CmbTheme.SelectedIndex == 1 ? "Light" : "Dark";
-            if (CmbMode != null) _currentSettings.Mode = CmbMode.SelectedIndex == 1 ? "Proxy" : "TUN";
-            if (TxtDns != null) _currentSettings.RemoteDns = string.IsNullOrWhiteSpace(TxtDns.Text) ? "8.8.8.8" : TxtDns.Text.Trim();
-
-            bool oldAutoStart = _currentSettings.AutoStart;
-            if (ChkAutoStart != null) _currentSettings.AutoStart = ChkAutoStart.IsChecked ?? false;
-            if (ChkAutoConnect != null) _currentSettings.AutoConnect = ChkAutoConnect.IsChecked ?? false;
-            if (ChkStartMinimized != null) _currentSettings.StartMinimized = ChkStartMinimized.IsChecked ?? false;
-            if (ChkUseCustomConfig != null) _currentSettings.UseCustomConfig = ChkUseCustomConfig.IsChecked ?? false;
-
-            bool oldVisual = _currentSettings.EnableVisualEffects;
-            if (ChkVisualEffects != null) _currentSettings.EnableVisualEffects = ChkVisualEffects.IsChecked ?? false;
-            if (ChkDisableAnimations != null) _currentSettings.DisableAnimations = ChkDisableAnimations.IsChecked ?? false;
-
-            if (TxtProxyPort != null && int.TryParse(TxtProxyPort.Text, out int port)) _currentSettings.ProxyPort = port;
-            if (ChkAllowLan != null) _currentSettings.AllowLan = ChkAllowLan.IsChecked ?? false;
-
-            if (CmbTunStack?.SelectedItem is ComboBoxItem tsItem && tsItem.Tag != null) _currentSettings.TunStack = tsItem.Tag.ToString() ?? "system";
-            if (CmbLogLevel?.SelectedItem is ComboBoxItem llItem && llItem.Tag != null) _currentSettings.LogLevel = llItem.Tag.ToString() ?? "info";
-            if (CmbLanguage?.SelectedValue is string langValue) _currentSettings.Language = langValue;
-
+            _saveSettingsCts?.Cancel();
+            SyncSettingsFromUI();
             string json = JsonSerializer.Serialize(_currentSettings, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(Path.Combine(_baseDirectory, "settings.json"), json);
-
-            if (oldAutoStart != _currentSettings.AutoStart) ManageAutoStart(_currentSettings.AutoStart);
-            if (oldVisual != _currentSettings.EnableVisualEffects) ApplyVisualEffects();
+            File.WriteAllText(Path.Combine(_exeDirectory, "settings.json"), json);
         }
         catch { }
     }
 
-    private static void ManageAutoStart(bool enable)
+    private async void SaveSettings()
+    {
+        if (_isUpdatingSettings) return;
+
+        try
+        {
+            SyncSettingsFromUI();
+
+            _saveSettingsCts?.Cancel();
+            _saveSettingsCts = new CancellationTokenSource();
+            var token = _saveSettingsCts.Token;
+
+            await Task.Delay(500, token);
+
+            string json = JsonSerializer.Serialize(_currentSettings, new JsonSerializerOptions { WriteIndented = true });
+            await File.WriteAllTextAsync(Path.Combine(_exeDirectory, "settings.json"), json, token);
+
+            if (_lastAppliedAutoStart != _currentSettings.AutoStart)
+            {
+                bool targetAutoStart = _currentSettings.AutoStart;
+                _lastAppliedAutoStart = targetAutoStart;
+                await ManageAutoStartAsync(targetAutoStart);
+            }
+        }
+        catch (TaskCanceledException) { }
+        catch { }
+    }
+
+    private static async Task ManageAutoStartAsync(bool enable)
     {
         try
         {
-            string exePath = Process.GetCurrentProcess().MainModule?.FileName ?? "";
-            if (string.IsNullOrEmpty(exePath)) return;
-
-            string taskName = $"NeonV_Autostart_{Environment.UserName}";
-
-            if (enable)
+            await Task.Run(() =>
             {
-                string userId = System.Security.Principal.WindowsIdentity.GetCurrent().Name;
-                string xml = $@"<?xml version=""1.0"" encoding=""UTF-16""?>
+                string exePath = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+                if (string.IsNullOrEmpty(exePath)) return;
+
+                string taskName = $"NeonV_Autostart_{Environment.UserName}";
+
+                if (enable)
+                {
+                    string userId = System.Security.Principal.WindowsIdentity.GetCurrent().Name;
+                    string safeUserId = SecurityElement.Escape(userId) ?? userId;
+                    string safeExePath = SecurityElement.Escape(exePath) ?? exePath;
+                    string xml = $@"<?xml version=""1.0"" encoding=""UTF-16""?>
 <Task version=""1.2"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
-  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{userId}</UserId></LogonTrigger></Triggers>
-  <Principals><Principal id=""Author""><UserId>{userId}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{safeUserId}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id=""Author""><UserId>{safeUserId}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings>
-  <Actions Context=""Author""><Exec><Command>{exePath}</Command><Arguments>--autostart</Arguments></Exec></Actions>
+  <Actions Context=""Author""><Exec><Command>{safeExePath}</Command><Arguments>--autostart</Arguments></Exec></Actions>
 </Task>";
-                string tempFile = Path.Combine(Path.GetTempPath(), $"{taskName}.xml");
-                File.WriteAllText(tempFile, xml);
+                    string tempFile = Path.Combine(Path.GetTempPath(), $"{taskName}.xml");
+                    File.WriteAllText(tempFile, xml);
 
-                using var p = Process.Start(new ProcessStartInfo("schtasks.exe", $"/create /tn \"{taskName}\" /xml \"{tempFile}\" /f") { CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, UseShellExecute = false });
-                p?.WaitForExit();
-                try { File.Delete(tempFile); } catch { }
-            }
-            else
-            {
-                using var p = Process.Start(new ProcessStartInfo("schtasks.exe", $"/delete /tn \"{taskName}\" /f") { CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden, UseShellExecute = false });
-                p?.WaitForExit();
-            }
+                    var psi = new ProcessStartInfo("schtasks.exe", $"/create /tn \"{taskName}\" /xml \"{tempFile}\" /f")
+                    {
+                        CreateNoWindow = true,
+                        WindowStyle = ProcessWindowStyle.Hidden,
+                        UseShellExecute = true,
+                        Verb = "runas"
+                    };
+                    using var p = Process.Start(psi);
+                    p?.WaitForExit();
+                    try { File.Delete(tempFile); } catch { }
+                }
+                else
+                {
+                    var psi = new ProcessStartInfo("schtasks.exe", $"/delete /tn \"{taskName}\" /f")
+                    {
+                        CreateNoWindow = true,
+                        WindowStyle = ProcessWindowStyle.Hidden,
+                        UseShellExecute = true,
+                        Verb = "runas"
+                    };
+                    using var p = Process.Start(psi);
+                    p?.WaitForExit();
+                }
+            });
         }
         catch { }
     }
@@ -1369,6 +4060,10 @@ public partial class MainWindow : Window
     {
         Dispatcher.InvokeAsync(async () =>
         {
+            _notificationCts?.Cancel();
+            _notificationCts = new CancellationTokenSource();
+            var token = _notificationCts.Token;
+
             if (TxtNotification != null) TxtNotification.Text = message;
             if (FindResource("TextColor") is Brush textColor && TxtNotification != null)
                 TxtNotification.Foreground = isError ? new SolidColorBrush(Color.FromRgb(248, 113, 113)) : textColor;
@@ -1377,33 +4072,57 @@ public partial class MainWindow : Window
             {
                 NotificationSnackbar.IsHitTestVisible = true;
                 NotificationSnackbar.BeginAnimation(OpacityProperty, new DoubleAnimation { To = 1, Duration = GetDuration(0.2) });
-                await Task.Delay(3000);
-                NotificationSnackbar.BeginAnimation(OpacityProperty, new DoubleAnimation { To = 0, Duration = GetDuration(0.2) });
-                NotificationSnackbar.IsHitTestVisible = false;
+                try
+                {
+                    await Task.Delay(3000, token);
+                    NotificationSnackbar.BeginAnimation(OpacityProperty, new DoubleAnimation { To = 0, Duration = GetDuration(0.2) });
+                    NotificationSnackbar.IsHitTestVisible = false;
+                }
+                catch (TaskCanceledException) { }
             }
         });
     }
 
     private void NumberValidation(object sender, TextCompositionEventArgs e) => e.Handled = !int.TryParse(e.Text, out _);
 
+    private void CmbLanguage_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isUpdatingSettings) return;
+        if (CmbLanguage?.SelectedItem is ComboBoxItem item && item.Tag is string lang)
+        {
+            ApplyLanguage(lang);
+            SaveSettings();
+        }
+    }
+
     private void CmbTheme_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_isUpdatingSettings) return;
-        ApplyTheme(CmbTheme?.SelectedIndex == 1 ? "Light" : "Dark");
+        if (CmbTheme?.SelectedItem is ComboBoxItem item && item.Tag is string themeTag)
+        {
+            _currentSettings.Theme = themeTag;
+            ApplyTheme(themeTag);
+            SaveSettings();
+        }
+    }
+
+    private void ChkVisualEffects_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_isUpdatingSettings) return;
+        _currentSettings.EnableVisualEffects = ChkVisualEffects?.IsChecked ?? false;
+        ApplyVisualEffects();
         SaveSettings();
     }
 
-    private void CmbLanguage_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void CmbSettings_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_isUpdatingSettings || CmbLanguage?.SelectedValue is not string lang) return;
-        _currentSettings.Language = lang;
-        ApplyLanguage();
+        if (_isUpdatingSettings) return;
         SaveSettings();
-    }
-
-    private void CmbSettings_SelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (!_isUpdatingSettings) SaveSettings();
+        if (_isRunning && _currentSettings.Mode != "Proxy")
+        {
+            ShowNotification(L("NotifySettingsReconnecting"));
+            await RestartVpnAsync();
+        }
     }
 
     private async void CmbLogLevel_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1412,7 +4131,7 @@ public partial class MainWindow : Window
         SaveSettings();
         if (_isRunning)
         {
-            ShowNotification(GetString("Lang_MsgLogLevelChanged"));
+            ShowNotification(L("NotifyLogLevelReconnecting"));
             await RestartVpnAsync();
         }
     }
@@ -1426,55 +4145,122 @@ public partial class MainWindow : Window
 
         if (_isRunning)
         {
-            if (BtnToggle != null) BtnToggle.IsEnabled = false;
-            if (_trayToggleItem != null) _trayToggleItem.Enabled = false;
-
-            await StopVPNAsync();
-            await Task.Delay(500);
-            await StartVPNAsync();
-
-            if (BtnToggle != null) BtnToggle.IsEnabled = true;
-            if (_trayToggleItem != null) _trayToggleItem.Enabled = true;
+            ShowNotification(L("NotifyModeReconnecting"));
+            await RestartVpnAsync();
         }
     }
 
     private void TxtSettings_Changed(object sender, RoutedEventArgs e) => SaveSettings();
 
+    private async void ChkReconnectSetting_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_isUpdatingSettings) return;
+        SaveSettings();
+        if (_isRunning)
+        {
+            ShowNotification(L("NotifySettingsReconnecting"));
+            await RestartVpnAsync();
+        }
+    }
+
+    private async void ChkTunReconnectSetting_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_isUpdatingSettings) return;
+        SaveSettings();
+        if (_isRunning && _currentSettings.Mode != "Proxy")
+        {
+            ShowNotification(L("NotifySettingsReconnecting"));
+            await RestartVpnAsync();
+        }
+    }
+
+    private string _runningDns = "8.8.8.8";
+    private string _runningDirectDns = "77.88.8.8";
+    private int _runningProxyPort = 2080;
+    private int _runningConfiguredProxyPort = 2080;
+
+    private async void TxtReconnectSetting_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (_isUpdatingSettings || !_isRunning) return;
+
+        string newDns = string.IsNullOrWhiteSpace(TxtDns?.Text) ? "8.8.8.8" : TxtDns.Text.Trim();
+        string newDirectDns = string.IsNullOrWhiteSpace(TxtDirectDns?.Text) ? "77.88.8.8" : TxtDirectDns.Text.Trim();
+        int newPort = TxtProxyPort != null && int.TryParse(TxtProxyPort.Text, out int p) && p is >= 1 and <= 65535 ? p : 2080;
+
+        bool dnsChanged = !string.Equals(newDns, _runningDns, StringComparison.OrdinalIgnoreCase);
+        bool directDnsChanged = !string.Equals(newDirectDns, _runningDirectDns, StringComparison.OrdinalIgnoreCase);
+        bool portChanged = _currentSettings.Mode == "Proxy" && newPort != _runningConfiguredProxyPort;
+
+        if (dnsChanged || directDnsChanged || portChanged)
+        {
+            SaveSettings();
+            ShowNotification(L("NotifySettingsReconnecting"));
+            await RestartVpnAsync();
+        }
+    }
+
     private void TxtSearch_TextChanged(object sender, TextChangedEventArgs e)
     {
-        if (CollectionViewSource.GetDefaultView(_profiles) is { } view)
+        if (CollectionViewSource.GetDefaultView(_standaloneProfiles) is { } view)
         {
             view.Filter = item =>
             {
                 if (string.IsNullOrWhiteSpace(TxtSearch?.Text)) return true;
                 var p = (VpnProfile)item;
                 return p.Name.Contains(TxtSearch.Text, StringComparison.OrdinalIgnoreCase) ||
+                       p.DisplayName.Contains(TxtSearch.Text, StringComparison.OrdinalIgnoreCase) ||
                        p.Address.Contains(TxtSearch.Text, StringComparison.OrdinalIgnoreCase);
             };
         }
     }
 
-    private void LvProfiles_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private async void LvProfiles_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        SaveSettings();
-        if (LvProfiles?.SelectedItem is VpnProfile p) _ = p.CheckPingAsync();
-    }
+        if (_isUpdatingSettings) return;
 
-    private void LvProfiles_KeyDown(object sender, KeyEventArgs e)
-    {
-        if (e.Key == Key.Delete && LvProfiles?.SelectedItem is VpnProfile p)
+        if (LvProfiles?.SelectedItem is VpnProfile p)
         {
-            _profiles.Remove(p);
+            bool serverChanged = ActiveProfile != p;
+            ActiveProfile = p;
+            RefreshAllVisualIndicators();
             SaveSettings();
-            UpdateEmptyState();
+            _ = p.CheckPingAsync();
+
+            if (_isRunning && serverChanged)
+            {
+                ShowNotification(L("NotifyReconnectingServer"));
+                await RestartVpnAsync();
+            }
         }
     }
 
-    private string FormatTrayText(string input)
+    private async void LvProfiles_KeyDown(object sender, KeyEventArgs e)
     {
-        if (string.IsNullOrWhiteSpace(input)) return input;
-        var lower = input.ToLower().Replace("vpn", "VPN").Replace("proxy", "Proxy");
-        return char.ToUpper(lower[0]) + lower.Substring(1);
+        if (LvProfiles?.SelectedItem is VpnProfile p)
+        {
+            if (e.Key == Key.Delete)
+            {
+                bool wasActive = ActiveProfile == p;
+                _profiles.Remove(p);
+                _standaloneProfiles.Remove(p);
+                if (wasActive)
+                {
+                    ActiveProfile = _standaloneProfiles.FirstOrDefault() ?? _profiles.FirstOrDefault();
+                    RefreshAllVisualIndicators();
+                    if (_isRunning) await StopVPNAsync();
+                }
+                SaveSettings();
+                UpdateEmptyState();
+            }
+            else if (e.Key == Key.Enter)
+            {
+                if (!_isRunning) await ToggleVpnAsync();
+            }
+            else if (e.Key == Key.C && Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                MenuItem_CopyLink_Click(null!, null!);
+            }
+        }
     }
 
     private void UpdateButtonText()
@@ -1484,17 +4270,15 @@ public partial class MainWindow : Window
 
         if (_isRunning)
         {
-            string disableText = GetString(mode == "Proxy" ? "Lang_BtnDisableProxy" : "Lang_BtnDisableVpn");
-            BtnToggleText.Text = disableText;
+            BtnToggleText.Text = mode == "Proxy" ? L("BtnDisconnectProxy") : L("BtnDisconnectVpn");
             BtnToggle.Background = new SolidColorBrush(Color.FromRgb(179, 38, 30));
-            if (_trayToggleItem != null) _trayToggleItem.Text = FormatTrayText(disableText);
+            if (_trayToggleItem != null) _trayToggleItem.Text = mode == "Proxy" ? L("TrayDisconnectProxy") : L("TrayDisconnectVpn");
         }
         else
         {
-            string enableText = GetString(mode == "Proxy" ? "Lang_BtnEnableProxy" : "Lang_BtnEnableVpn");
-            BtnToggleText.Text = enableText;
+            BtnToggleText.Text = mode == "Proxy" ? L("BtnConnectProxy") : L("BtnConnectVpn");
             BtnToggle.SetResourceReference(Control.BackgroundProperty, "ToggleBtnBgColor");
-            if (_trayToggleItem != null) _trayToggleItem.Text = FormatTrayText(enableText);
+            if (_trayToggleItem != null) _trayToggleItem.Text = mode == "Proxy" ? L("TrayConnectProxy") : L("TrayConnectVpn");
         }
         ApplyVisualEffects();
     }
@@ -1504,8 +4288,12 @@ public partial class MainWindow : Window
         if (target != null && target.Visibility == Visibility.Visible) return;
 
         if (ViewMain != null) ViewMain.Visibility = Visibility.Collapsed;
+        if (ViewSubscriptions != null) ViewSubscriptions.Visibility = Visibility.Collapsed;
         if (ViewSettings != null) ViewSettings.Visibility = Visibility.Collapsed;
         if (ViewLogs != null) ViewLogs.Visibility = Visibility.Collapsed;
+
+        if (SharedConnectBar != null)
+            SharedConnectBar.Visibility = (target == ViewMain || target == ViewSubscriptions) ? Visibility.Visible : Visibility.Collapsed;
 
         if (target != null)
         {
@@ -1519,6 +4307,7 @@ public partial class MainWindow : Window
         if (FindResource("TextMutedColor") is Brush muted && FindResource("AccentColor") is Brush accent)
         {
             if (BtnNavMain != null) BtnNavMain.Foreground = muted;
+            if (BtnNavSubscriptions != null) BtnNavSubscriptions.Foreground = muted;
             if (BtnNavSettings != null) BtnNavSettings.Foreground = muted;
             if (BtnNavLogs != null) BtnNavLogs.Foreground = muted;
             if (activeBtn != null) activeBtn.Foreground = accent;
@@ -1528,12 +4317,22 @@ public partial class MainWindow : Window
     }
 
     private void BtnNavMain_Click(object sender, RoutedEventArgs e) { SwitchTab(ViewMain); UpdateMenuIndicator(BtnNavMain, 0); }
-    private void BtnNavSettings_Click(object sender, RoutedEventArgs e) { SwitchTab(ViewSettings); UpdateMenuIndicator(BtnNavSettings, 48); }
-    private void BtnNavLogs_Click(object sender, RoutedEventArgs e) { SwitchTab(ViewLogs); UpdateMenuIndicator(BtnNavLogs, 96); }
+    private void BtnNavSubscriptions_Click(object sender, RoutedEventArgs e) { SwitchTab(ViewSubscriptions); UpdateMenuIndicator(BtnNavSubscriptions, 48); }
+    private void BtnNavSettings_Click(object sender, RoutedEventArgs e) { SwitchTab(ViewSettings); UpdateMenuIndicator(BtnNavSettings, 96); }
+    private void BtnNavLogs_Click(object sender, RoutedEventArgs e) { SwitchTab(ViewLogs); UpdateMenuIndicator(BtnNavLogs, 144); }
 
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.V && Keyboard.Modifiers == ModifierKeys.Control && OverlayImport?.Visibility != Visibility.Visible && OverlayRouting?.Visibility != Visibility.Visible && OverlayQR?.Visibility != Visibility.Visible)
+        if (e.Key == Key.Escape)
+        {
+            if (_fullScreenOverlay != null) { _fullScreenOverlay.Close(); _fullScreenOverlay = null; e.Handled = true; return; }
+            if (OverlayQR?.Visibility == Visibility.Visible) { CloseQROverlay(); e.Handled = true; return; }
+            if (OverlayRouting?.Visibility == Visibility.Visible) { CloseRoutingOverlay(false); e.Handled = true; return; }
+            if (OverlaySubscription?.Visibility == Visibility.Visible) { CloseSubscriptionOverlay(); e.Handled = true; return; }
+            if (OverlayImport?.Visibility == Visibility.Visible) { CloseImportOverlay(); e.Handled = true; return; }
+        }
+
+        if (e.Key == Key.V && Keyboard.Modifiers == ModifierKeys.Control && OverlayImport?.Visibility != Visibility.Visible && OverlayRouting?.Visibility != Visibility.Visible && OverlayQR?.Visibility != Visibility.Visible && OverlaySubscription?.Visibility != Visibility.Visible)
         {
             PerformClipboardImport();
             e.Handled = true;
@@ -1542,23 +4341,30 @@ public partial class MainWindow : Window
 
     private async Task RestartVpnAsync()
     {
-        if (!_isRunning) return;
+        await _vpnStateSemaphore.WaitAsync();
+        try
+        {
+            if (!_isRunning) return;
 
-        if (BtnToggle != null) BtnToggle.IsEnabled = false;
-        if (_trayToggleItem != null) _trayToggleItem.Enabled = false;
+            if (BtnToggle != null) BtnToggle.IsEnabled = false;
+            if (_trayToggleItem != null) _trayToggleItem.Enabled = false;
 
-        await StopVPNAsync();
-        await Task.Delay(500);
-        await StartVPNAsync();
-
-        if (BtnToggle != null) BtnToggle.IsEnabled = true;
-        if (_trayToggleItem != null) _trayToggleItem.Enabled = true;
+            await StopVpnCoreAsync();
+            await Task.Delay(400);
+            await StartVpnCoreAsync();
+        }
+        finally
+        {
+            if (BtnToggle != null) BtnToggle.IsEnabled = true;
+            if (_trayToggleItem != null) _trayToggleItem.Enabled = true;
+            _vpnStateSemaphore.Release();
+        }
     }
 
     private void BtnOpenImport_Click(object sender, RoutedEventArgs e)
     {
         _editingProfile = null;
-        if (TxtImportTitle != null) TxtImportTitle.Text = GetString("Lang_AddProfileTitle");
+        if (TxtImportTitle != null) TxtImportTitle.Text = L("ImportTitle");
         if (BtnPasteImport != null) BtnPasteImport.Visibility = Visibility.Visible;
         if (ImportSeparator != null) ImportSeparator.Visibility = Visibility.Visible;
         if (TxtOrManual != null) TxtOrManual.Visibility = Visibility.Visible;
@@ -1574,6 +4380,7 @@ public partial class MainWindow : Window
 
     private void CloseImportOverlay()
     {
+        _editingProfile = null;
         var fadeOut = new DoubleAnimation { To = 0, Duration = GetDuration(0.2) };
         fadeOut.Completed += (_, _) => { if (OverlayImport != null) OverlayImport.Visibility = Visibility.Collapsed; };
 
@@ -1586,6 +4393,790 @@ public partial class MainWindow : Window
     private void BtnCancelImport_Click(object sender, RoutedEventArgs e) => CloseImportOverlay();
     private void BtnPasteFromClipboard_Click(object sender, RoutedEventArgs e) => PerformClipboardImport();
 
+    private void BtnToggleExpandSubscription_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement header && header.Tag is Subscription sub)
+        {
+            sub.IsExpanded = !sub.IsExpanded;
+            SaveSettings();
+
+            if (LogicalTreeHelper.FindLogicalNode(header, "SubChevron") is UIElement chevron &&
+                chevron.RenderTransform is RotateTransform rot)
+            {
+                rot.BeginAnimation(RotateTransform.AngleProperty, new DoubleAnimation
+                {
+                    To = sub.IsExpanded ? 90.0 : 0.0,
+                    Duration = GetDuration(0.24),
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                });
+            }
+
+            var container = header.Parent is DependencyObject parent
+                ? LogicalTreeHelper.FindLogicalNode(parent, "SubProfilesContainer") as FrameworkElement
+                : null;
+
+            if (container == null)
+            {
+                sub.NotifyAll();
+                return;
+            }
+
+            if (container.LayoutTransform is not ScaleTransform scale)
+            {
+                scale = new ScaleTransform(1, sub.IsExpanded ? 0 : 1);
+                container.LayoutTransform = scale;
+            }
+
+            if (sub.IsExpanded)
+            {
+                if (container.Visibility != Visibility.Visible)
+                {
+                    container.Opacity = 0;
+                    scale.ScaleY = 0;
+                    container.Visibility = Visibility.Visible;
+                }
+                container.BeginAnimation(OpacityProperty, new DoubleAnimation
+                {
+                    To = 1,
+                    Duration = GetDuration(0.22),
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                });
+                scale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation
+                {
+                    To = 1,
+                    Duration = GetDuration(0.26),
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                });
+            }
+            else
+            {
+                container.BeginAnimation(OpacityProperty, new DoubleAnimation
+                {
+                    To = 0,
+                    Duration = GetDuration(0.18),
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn }
+                });
+                var collapseAnim = new DoubleAnimation
+                {
+                    To = 0,
+                    Duration = GetDuration(0.24),
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                };
+                collapseAnim.Completed += (_, _) =>
+                {
+                    if (!sub.IsExpanded)
+                        container.Visibility = Visibility.Collapsed;
+                };
+                scale.BeginAnimation(ScaleTransform.ScaleYProperty, collapseAnim);
+            }
+        }
+    }
+
+    private async void SubProfile_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: VpnProfile profile })
+        {
+            bool serverChanged = ActiveProfile != profile;
+            ActiveProfile = profile;
+            _isUpdatingSettings = true;
+            if (LvProfiles != null) LvProfiles.SelectedItem = null;
+            _isUpdatingSettings = false;
+
+            RefreshAllVisualIndicators();
+            SaveSettings();
+            _ = profile.CheckPingAsync();
+
+            if (_isRunning && serverChanged)
+            {
+                ShowNotification(L("NotifyReconnectingServer"));
+                await RestartVpnAsync();
+            }
+            else if (e.ClickCount == 2 && !_isRunning)
+            {
+                await StartVPNAsync();
+            }
+        }
+    }
+
+    private void RefreshAllVisualIndicators()
+    {
+        foreach (var p in _profiles) p.NotifyVisuals();
+    }
+
+    private void BtnOpenAddSubscription_Click(object sender, RoutedEventArgs e)
+    {
+        if (TxtSubscriptionName != null) TxtSubscriptionName.Text = "";
+        if (TxtSubscriptionUrl != null) TxtSubscriptionUrl.Text = "";
+
+        if (OverlaySubscription != null) OverlaySubscription.Visibility = Visibility.Visible;
+        OverlaySubscriptionBg?.BeginAnimation(OpacityProperty, new DoubleAnimation { To = 1, Duration = GetDuration(0.2) });
+        OverlaySubscriptionCard?.BeginAnimation(OpacityProperty, new DoubleAnimation { To = 1, Duration = GetDuration(0.2) });
+        OverlaySubscriptionTransform?.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation { To = 0, Duration = GetDuration(0.2), EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
+    }
+
+    private void CloseSubscriptionOverlay()
+    {
+        var fadeOut = new DoubleAnimation { To = 0, Duration = GetDuration(0.2) };
+        fadeOut.Completed += (_, _) => { if (OverlaySubscription != null) OverlaySubscription.Visibility = Visibility.Collapsed; };
+
+        OverlaySubscriptionBg?.BeginAnimation(OpacityProperty, fadeOut);
+        OverlaySubscriptionCard?.BeginAnimation(OpacityProperty, fadeOut);
+        OverlaySubscriptionTransform?.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation { To = 30, Duration = GetDuration(0.2), EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn } });
+    }
+
+    private void OverlaySubscriptionBg_MouseDown(object sender, MouseButtonEventArgs e) => CloseSubscriptionOverlay();
+    private void BtnCancelSubscription_Click(object sender, RoutedEventArgs e) => CloseSubscriptionOverlay();
+
+    private async void BtnSaveSubscription_Click(object sender, RoutedEventArgs e)
+    {
+        string url = TxtSubscriptionUrl?.Text.Trim() ?? "";
+        if (string.IsNullOrEmpty(url) || !Uri.TryCreate(url, UriKind.Absolute, out _))
+        {
+            ShowNotification(L("NotifySubInvalidUrl"), true);
+            return;
+        }
+
+        string name = TxtSubscriptionName?.Text.Trim() ?? "";
+        if (string.IsNullOrEmpty(name))
+        {
+            try { name = new Uri(url).Host; } catch { name = "Subscription"; }
+        }
+
+        var sub = new Subscription { Name = name, Url = url, IsExpanded = true };
+
+        _subscriptions.Add(sub);
+        SaveSettings();
+        UpdateEmptyState();
+        CloseSubscriptionOverlay();
+
+        ShowNotification(L("NotifySubLoading"));
+        await UpdateSubscriptionAsync(sub);
+    }
+
+    private async void BtnPingSubscription_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: Subscription sub } btn) return;
+        if (sub.Profiles.Count == 0) return;
+
+        btn.IsEnabled = false;
+        try
+        {
+            PingManager.Clear();
+            var list = sub.Profiles.ToList();
+            foreach (var p in list)
+            {
+                p.PingText = "...";
+                p.ResetGeoIpRetry();
+            }
+
+            await Task.WhenAll(list.Select(p => p.CheckPingAsync(bypassCache: true)));
+        }
+        finally
+        {
+            btn.IsEnabled = true;
+        }
+    }
+
+    private async void BtnUpdateSingleSubscription_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: Subscription sub })
+        {
+            await UpdateSubscriptionAsync(sub);
+        }
+    }
+
+    private async void BtnUpdateAllSubscriptions_Click(object sender, RoutedEventArgs e)
+    {
+        if (_subscriptions.Count == 0) return;
+        ShowNotification(L("NotifySubAllUpdating"));
+        foreach (var sub in _subscriptions.ToList())
+        {
+            await UpdateSubscriptionAsync(sub, false);
+        }
+        ShowNotification(L("NotifySubAllUpdated"));
+    }
+
+    private async void BtnDeleteSubscription_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: Subscription sub })
+        {
+            bool wasActiveFromSub = ActiveProfile != null && ActiveProfile.SubscriptionId == sub.Id;
+
+            _subscriptions.Remove(sub);
+            var profilesToRemove = _profiles.Where(p => p.SubscriptionId == sub.Id).ToList();
+            foreach (var p in profilesToRemove) _profiles.Remove(p);
+
+            if (wasActiveFromSub)
+            {
+                ActiveProfile = _standaloneProfiles.FirstOrDefault() ?? _profiles.FirstOrDefault();
+                RefreshAllVisualIndicators();
+                if (_isRunning) await StopVPNAsync();
+            }
+
+            SaveSettings();
+            UpdateEmptyState();
+            ShowNotification(L("NotifySubDeleted"));
+        }
+    }
+
+    private static string SafeBase64Decode(string input)
+    {
+        try
+        {
+            input = Regex.Replace(input.Trim(), @"\s+", "").Replace("-", "+").Replace("_", "/");
+            int mod4 = input.Length % 4;
+            if (mod4 > 0) input += new string('=', 4 - mod4);
+            byte[] bytes = Convert.FromBase64String(input);
+            return System.Text.Encoding.UTF8.GetString(bytes);
+        }
+        catch { return ""; }
+    }
+
+    private sealed record ClientFetchIdentity(string UserAgent, string Os, string VerOs, string Model, string? AppVersion);
+
+    private sealed record SubscriptionFetchResult(
+        HttpStatusCode StatusCode,
+        string Content,
+        string? UserInfo,
+        string? ProfileTitle,
+        bool MaxDevicesReached,
+        bool HwidNotSupported);
+
+    private static async Task<SubscriptionFetchResult> FetchWithHeadersAndRedirectsAsync(string url, ClientFetchIdentity id, string hwid)
+    {
+        using var handler = new HttpClientHandler
+        {
+            AllowAutoRedirect = false,
+            AutomaticDecompression = DecompressionMethods.All
+        };
+        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
+
+        Uri currentUri = new(url);
+        HttpResponseMessage? response = null;
+
+        for (int redirect = 0; redirect < 6; redirect++)
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Get, currentUri);
+            req.Headers.TryAddWithoutValidation("User-Agent", id.UserAgent);
+            req.Headers.TryAddWithoutValidation("x-hwid", hwid);
+            req.Headers.TryAddWithoutValidation("x-device-os", id.Os);
+            req.Headers.TryAddWithoutValidation("x-ver-os", id.VerOs);
+            req.Headers.TryAddWithoutValidation("x-device-model", id.Model);
+            req.Headers.TryAddWithoutValidation("x-device-locale", CurrentLanguage);
+            if (!string.IsNullOrEmpty(id.AppVersion))
+                req.Headers.TryAddWithoutValidation("x-app-version", id.AppVersion);
+            req.Headers.TryAddWithoutValidation("Accept", "*/*");
+
+            response = await client.SendAsync(req);
+            int code = (int)response.StatusCode;
+            if (code is 301 or 302 or 303 or 307 or 308 && response.Headers.Location != null)
+            {
+                Uri nextUri = response.Headers.Location.IsAbsoluteUri
+                    ? response.Headers.Location
+                    : new Uri(currentUri, response.Headers.Location);
+                response.Dispose();
+                currentUri = nextUri;
+                continue;
+            }
+            break;
+        }
+
+        if (response == null)
+            return new SubscriptionFetchResult(HttpStatusCode.ServiceUnavailable, "", null, null, false, false);
+
+        using (response)
+        {
+            bool maxDevices =
+                (response.Headers.TryGetValues("x-hwid-max-devices-reached", out var maxDev) && maxDev.Any(v => v.Equals("true", StringComparison.OrdinalIgnoreCase))) ||
+                (response.Headers.TryGetValues("x-hwid-limit", out var limDev) && limDev.Any(v => v.Equals("true", StringComparison.OrdinalIgnoreCase)));
+
+            bool hwidUnsupported =
+                response.Headers.TryGetValues("x-hwid-not-supported", out var notSup) && notSup.Any(v => v.Equals("true", StringComparison.OrdinalIgnoreCase));
+
+            string? userInfo = null;
+            if (response.Headers.TryGetValues("subscription-userinfo", out var hVals))
+                userInfo = string.Join(";", hVals);
+            else if (response.Content.Headers.TryGetValues("subscription-userinfo", out var cVals))
+                userInfo = string.Join(";", cVals);
+
+            string? profileTitle = null;
+            if (response.Headers.TryGetValues("profile-title", out var tVals))
+                profileTitle = tVals.FirstOrDefault();
+
+            string content = await response.Content.ReadAsStringAsync();
+            return new SubscriptionFetchResult(response.StatusCode, content, userInfo, profileTitle, maxDevices, hwidUnsupported);
+        }
+    }
+
+    private static void ApplySubscriptionUserInfo(Subscription sub, string info)
+    {
+        foreach (var part in info.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var kv = part.Trim().Split('=', 2);
+            if (kv.Length == 2)
+            {
+                string k = kv[0].Trim().ToLowerInvariant();
+                string v = kv[1].Trim();
+                if (k == "upload" && long.TryParse(v, out long up)) sub.UploadBytes = up;
+                else if (k == "download" && long.TryParse(v, out long dn)) sub.DownloadBytes = dn;
+                else if (k == "total" && long.TryParse(v, out long tot)) sub.TotalBytes = tot;
+                else if (k == "expire" && long.TryParse(v, out long exp) && exp > 0)
+                {
+                    try { sub.ExpireDate = DateTimeOffset.FromUnixTimeSeconds(exp).LocalDateTime; } catch { }
+                }
+            }
+        }
+    }
+
+    private async Task UpdateSubscriptionAsync(Subscription sub, bool showNotify = true)
+    {
+        try
+        {
+            string hwid = SanitizeHwid(_currentSettings.Hwid);
+            _currentSettings.Hwid = hwid;
+
+            var identities = new[]
+            {
+                new ClientFetchIdentity("Happ/4.6.0", "Windows", "11", "PC", "4.6.0"),
+                new ClientFetchIdentity("v2rayN/7.16.0", "Windows", "11", "PC", "7.16.0"),
+                new ClientFetchIdentity("v2raytun/2.0", "Windows", "11", "PC", "2.0"),
+                new ClientFetchIdentity("Happ/3.13.0", "Android", "15", "Pixel 8", "3.13.0"),
+                new ClientFetchIdentity("FlClashX/0.2.0", "Windows", "11", "PC", "0.2.0"),
+                new ClientFetchIdentity("HiddifyNext/2.5.7", "Windows", "11", "PC", "2.5.7")
+            };
+
+            List<VpnProfile>? parsedProfiles = null;
+            SubscriptionFetchResult? lastResult = null;
+            bool rejectedByClient = false;
+
+            foreach (var id in identities)
+            {
+                var res = await FetchWithHeadersAndRedirectsAsync(sub.Url, id, hwid);
+                lastResult = res;
+
+                if (res.MaxDevicesReached)
+                {
+                    if (showNotify) ShowNotification(L("NotifySubDeviceLimit"), true);
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(res.UserInfo))
+                    ApplySubscriptionUserInfo(sub, res.UserInfo);
+
+                if ((int)res.StatusCode < 200 || (int)res.StatusCode >= 300)
+                    continue;
+
+                if (res.Content.TrimStart().StartsWith("happ://crypt", StringComparison.OrdinalIgnoreCase))
+                {
+                    rejectedByClient = true;
+                    continue;
+                }
+
+                var profiles = ParseSubscriptionContent(res.Content, sub, out bool sawUnsupportedStub);
+                if (profiles.Count > 0)
+                {
+                    parsedProfiles = profiles;
+                    break;
+                }
+
+                if (res.HwidNotSupported || sawUnsupportedStub)
+                    rejectedByClient = true;
+            }
+
+            if (parsedProfiles == null || parsedProfiles.Count == 0)
+            {
+                if (lastResult != null && ((int)lastResult.StatusCode < 200 || (int)lastResult.StatusCode >= 300))
+                {
+                    if (showNotify) ShowNotification(string.Format(L("NotifySubLoadErrorFmt"), lastResult.StatusCode), true);
+                }
+                else if (rejectedByClient || (lastResult?.Content.Contains("App not supported", StringComparison.OrdinalIgnoreCase) ?? false))
+                {
+                    if (showNotify) ShowNotification(L("NotifySubAppUnsupported"), true);
+                }
+                else
+                {
+                    if (showNotify) ShowNotification(L("NotifySubNoProfiles"), true);
+                }
+                return;
+            }
+
+            if (lastResult?.ProfileTitle is { } rawTitle && !string.IsNullOrWhiteSpace(rawTitle) && sub.Name == GetHostSafe(sub.Url))
+            {
+                string title = rawTitle.StartsWith("base64:", StringComparison.OrdinalIgnoreCase)
+                    ? SafeBase64Decode(rawTitle[7..])
+                    : rawTitle;
+                if (!string.IsNullOrWhiteSpace(title)) sub.Name = title.Trim();
+            }
+
+            string? prevActiveName = ActiveProfile?.SubscriptionId == sub.Id ? ActiveProfile.Name : null;
+            string? prevActiveHost = ActiveProfile?.SubscriptionId == sub.Id ? ActiveProfile.DisplayAddress : null;
+
+            var oldProfiles = _profiles.Where(p => p.SubscriptionId == sub.Id).ToList();
+            foreach (var op in oldProfiles) _profiles.Remove(op);
+            sub.Profiles.Clear();
+
+            foreach (var np in parsedProfiles)
+            {
+                np.SubscriptionName = sub.Name;
+                _profiles.Add(np);
+                sub.Profiles.Add(np);
+            }
+
+            if (prevActiveName != null)
+            {
+                ActiveProfile = parsedProfiles.FirstOrDefault(p => p.Name == prevActiveName && p.DisplayAddress == prevActiveHost)
+                             ?? parsedProfiles.FirstOrDefault(p => p.Name == prevActiveName)
+                             ?? parsedProfiles.FirstOrDefault();
+                RefreshAllVisualIndicators();
+            }
+
+            sub.LastUpdated = DateTime.Now;
+            sub.NotifyAll();
+
+            SaveSettings();
+            UpdateEmptyState();
+
+            PingManager.Clear();
+            _ = Task.WhenAll(parsedProfiles.Select(p => p.CheckPingAsync()));
+
+            if (showNotify) ShowNotification(string.Format(L("NotifySubUpdatedCountFmt"), parsedProfiles.Count));
+        }
+        catch (Exception ex)
+        {
+            if (showNotify) ShowNotification(string.Format(L("NotifySubErrorFmt"), ex.Message), true);
+        }
+    }
+
+    private static string GetHostSafe(string url)
+    {
+        try { return new Uri(url).Host; } catch { return ""; }
+    }
+
+    private static bool IsStubProfile(VpnProfile p)
+    {
+        if ((p.Address is "0.0.0.0" or "127.0.0.1" or "localhost" or "::1") && p.Port <= 1)
+            return true;
+
+        if (p.Name.Contains("App not supported", StringComparison.OrdinalIgnoreCase) ||
+            p.Name.Contains("Unsupported app", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
+    }
+
+    private static List<VpnProfile> ParseSubscriptionContent(string content, Subscription sub, out bool sawUnsupportedStub)
+    {
+        sawUnsupportedStub = false;
+        var result = new List<VpnProfile>();
+        string raw = content.Trim();
+
+        if (!raw.Contains("://") && !raw.StartsWith("{") && !raw.StartsWith("["))
+        {
+            string decoded = SafeBase64Decode(raw);
+            if (!string.IsNullOrEmpty(decoded)) raw = decoded;
+        }
+
+        if (raw.StartsWith("{") || raw.StartsWith("["))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(raw);
+                if (doc.RootElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var elem in doc.RootElement.EnumerateArray())
+                    {
+                        ParseJsonConfigElement(elem, sub, result, ref sawUnsupportedStub);
+                    }
+                    if (result.Count > 0 || sawUnsupportedStub) return result;
+                }
+                else if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                {
+                    ParseJsonConfigElement(doc.RootElement, sub, result, ref sawUnsupportedStub);
+                    if (result.Count > 0 || sawUnsupportedStub) return result;
+                }
+            }
+            catch { }
+        }
+
+        var lines = raw.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (var rawLine in lines)
+        {
+            string line = rawLine.Trim();
+            if (line.StartsWith("#subscription-userinfo:", StringComparison.OrdinalIgnoreCase))
+            {
+                ApplySubscriptionUserInfo(sub, line[23..].Trim());
+                continue;
+            }
+            if (line.StartsWith("#")) continue;
+
+            var p = new VpnProfile();
+            if (ParseLinkIntoProfile(p, line) && !string.IsNullOrEmpty(p.Address))
+            {
+                if (IsStubProfile(p))
+                {
+                    if (p.Name.Contains("App not supported", StringComparison.OrdinalIgnoreCase)) sawUnsupportedStub = true;
+                    continue;
+                }
+
+                p.SubscriptionId = sub.Id;
+                p.SubscriptionName = sub.Name;
+                result.Add(p);
+            }
+        }
+
+        return result;
+    }
+
+    private static void ParseJsonConfigElement(JsonElement root, Subscription sub, List<VpnProfile> result, ref bool sawUnsupportedStub)
+    {
+        string? topRemarks = root.TryGetProperty("remarks", out var rem) ? rem.GetString() : null;
+
+        if (root.TryGetProperty("endpoints", out var endpoints) && endpoints.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var ep in endpoints.EnumerateArray())
+            {
+                var p = ParseSingBoxEndpointToProfile(ep);
+                if (p != null)
+                {
+                    if (!string.IsNullOrWhiteSpace(topRemarks) && p.Name == p.Protocol) p.Name = topRemarks;
+                    if (IsStubProfile(p))
+                    {
+                        if (p.Name.Contains("App not supported", StringComparison.OrdinalIgnoreCase)) sawUnsupportedStub = true;
+                        continue;
+                    }
+                    p.SubscriptionId = sub.Id;
+                    p.SubscriptionName = sub.Name;
+                    result.Add(p);
+                }
+            }
+        }
+
+        if (root.TryGetProperty("outbounds", out var outbounds) && outbounds.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var ob in outbounds.EnumerateArray())
+            {
+                var p = ParseJsonOutboundToProfile(ob) ?? ParseXrayOutboundToProfile(ob, topRemarks);
+                if (p != null)
+                {
+                    if (IsStubProfile(p))
+                    {
+                        if (p.Name.Contains("App not supported", StringComparison.OrdinalIgnoreCase)) sawUnsupportedStub = true;
+                        continue;
+                    }
+
+                    p.SubscriptionId = sub.Id;
+                    p.SubscriptionName = sub.Name;
+                    result.Add(p);
+                }
+            }
+        }
+    }
+
+    private static VpnProfile? ParseSingBoxEndpointToProfile(JsonElement ep)
+    {
+        try
+        {
+            string type = ep.TryGetProperty("type", out var t) ? t.GetString() ?? "" : "";
+            if (type != "wireguard") return null;
+
+            var p = new VpnProfile
+            {
+                Protocol = "wireguard",
+                Name = ep.TryGetProperty("tag", out var tg) ? tg.GetString() ?? "wireguard" : "wireguard",
+                PrivateKey = ep.TryGetProperty("private_key", out var pk) ? pk.GetString() ?? "" : "",
+                Mtu = ep.TryGetProperty("mtu", out var mtu) ? mtu.GetInt32() : 1420
+            };
+
+            if (ep.TryGetProperty("address", out var addrArr) && addrArr.ValueKind == JsonValueKind.Array)
+                p.LocalAddress = string.Join(",", addrArr.EnumerateArray().Select(x => x.GetString()).Where(x => !string.IsNullOrEmpty(x)));
+
+            if (ep.TryGetProperty("peers", out var peers) && peers.ValueKind == JsonValueKind.Array)
+            {
+                var peer = peers.EnumerateArray().FirstOrDefault();
+                if (peer.ValueKind == JsonValueKind.Object)
+                {
+                    p.Address = peer.TryGetProperty("address", out var pa) ? pa.GetString() ?? "" : "";
+                    p.Port = peer.TryGetProperty("port", out var pp) ? pp.GetInt32() : 51820;
+                    p.PublicKey = peer.TryGetProperty("public_key", out var pub) ? pub.GetString() ?? "" : "";
+                }
+            }
+
+            return string.IsNullOrEmpty(p.Address) ? null : p;
+        }
+        catch { return null; }
+    }
+
+    private static VpnProfile? ParseJsonOutboundToProfile(JsonElement ob)
+    {
+        try
+        {
+            string type = ob.TryGetProperty("type", out var t) ? t.GetString() ?? "" : "";
+            if (string.IsNullOrEmpty(type) || type is "direct" or "block" or "dns" or "selector" or "urltest") return null;
+
+            var p = new VpnProfile
+            {
+                Protocol = type,
+                Name = ob.TryGetProperty("tag", out var tg) ? tg.GetString() ?? type : type,
+                Address = ob.TryGetProperty("server", out var s) ? s.GetString() ?? "" : "",
+                Port = ob.TryGetProperty("server_port", out var pt) ? pt.GetInt32() : 443
+            };
+
+            if (ob.TryGetProperty("uuid", out var id)) p.Uuid = id.GetString() ?? "";
+            if (ob.TryGetProperty("password", out var pw)) p.Password = pw.GetString() ?? "";
+            if (string.IsNullOrEmpty(p.Password) && ob.TryGetProperty("auth_str", out var authStr)) p.Password = authStr.GetString() ?? "";
+            if (ob.TryGetProperty("method", out var m)) p.Method = m.GetString() ?? p.Method;
+            if (ob.TryGetProperty("flow", out var fl)) p.Flow = fl.GetString() ?? "";
+            if (ob.TryGetProperty("private_key", out var pk)) p.PrivateKey = pk.GetString() ?? "";
+            if (ob.TryGetProperty("peer_public_key", out var pub)) p.PublicKey = pub.GetString() ?? "";
+
+            if (ob.TryGetProperty("up_mbps", out var upM) && upM.ValueKind == JsonValueKind.Number) p.Up = upM.GetInt32().ToString();
+            if (ob.TryGetProperty("down_mbps", out var dnM) && dnM.ValueKind == JsonValueKind.Number) p.Down = dnM.GetInt32().ToString();
+            if (ob.TryGetProperty("obfs", out var obfs))
+            {
+                if (obfs.ValueKind == JsonValueKind.Object)
+                {
+                    p.Obfs = obfs.TryGetProperty("type", out var ot) ? ot.GetString() ?? "" : "";
+                    p.ObfsPassword = obfs.TryGetProperty("password", out var op) ? op.GetString() ?? "" : "";
+                }
+                else if (obfs.ValueKind == JsonValueKind.String)
+                {
+                    p.Obfs = obfs.GetString() ?? "";
+                }
+            }
+
+            if (ob.TryGetProperty("tls", out var tls))
+            {
+                if (tls.TryGetProperty("enabled", out var en) && en.GetBoolean()) p.Security = "tls";
+                if (tls.TryGetProperty("server_name", out var sn)) p.Sni = sn.GetString() ?? "";
+                if (tls.TryGetProperty("insecure", out var ins)) p.Insecure = ins.GetBoolean();
+                if (tls.TryGetProperty("alpn", out var alpn) && alpn.ValueKind == JsonValueKind.Array)
+                    p.Alpn = string.Join(",", alpn.EnumerateArray().Select(x => x.GetString()).Where(x => !string.IsNullOrEmpty(x)));
+                if (tls.TryGetProperty("utls", out var utls) && utls.TryGetProperty("fingerprint", out var fp)) p.Fp = fp.GetString() ?? "";
+                if (tls.TryGetProperty("reality", out var reality))
+                {
+                    if (reality.TryGetProperty("public_key", out var pbk)) p.Pbk = pbk.GetString() ?? "";
+                    if (reality.TryGetProperty("short_id", out var sid)) p.Sid = sid.GetString() ?? "";
+                }
+            }
+
+            if (ob.TryGetProperty("transport", out var tr))
+            {
+                p.Transport = tr.TryGetProperty("type", out var trt) ? trt.GetString() ?? "tcp" : "tcp";
+                p.Path = tr.TryGetProperty("path", out var pth) ? pth.GetString() ?? "" : "";
+                if (string.IsNullOrEmpty(p.Path) && tr.TryGetProperty("service_name", out var snm)) p.Path = snm.GetString() ?? "";
+                if (tr.TryGetProperty("headers", out var hd) && hd.TryGetProperty("Host", out var hst)) p.Host = hst.GetString() ?? "";
+                else if (tr.TryGetProperty("host", out var hst2))
+                {
+                    p.Host = hst2.ValueKind == JsonValueKind.Array
+                        ? hst2.EnumerateArray().FirstOrDefault().GetString() ?? ""
+                        : hst2.GetString() ?? "";
+                }
+            }
+
+            return string.IsNullOrEmpty(p.Address) ? null : p;
+        }
+        catch { return null; }
+    }
+
+    private static VpnProfile? ParseXrayOutboundToProfile(JsonElement ob, string? fallbackName)
+    {
+        try
+        {
+            string protocol = ob.TryGetProperty("protocol", out var pr) ? pr.GetString()?.ToLowerInvariant() ?? "" : "";
+            if (string.IsNullOrEmpty(protocol) || protocol is "freedom" or "blackhole" or "dns") return null;
+
+            var p = new VpnProfile
+            {
+                Protocol = protocol == "hy2" ? "hysteria2" : protocol,
+                Name = !string.IsNullOrWhiteSpace(fallbackName) ? fallbackName : (ob.TryGetProperty("tag", out var tg) ? tg.GetString() ?? protocol : protocol)
+            };
+
+            if (ob.TryGetProperty("settings", out var settings))
+            {
+                if (settings.TryGetProperty("vnext", out var vnext) && vnext.ValueKind == JsonValueKind.Array)
+                {
+                    var node = vnext.EnumerateArray().FirstOrDefault();
+                    if (node.ValueKind == JsonValueKind.Object)
+                    {
+                        p.Address = node.TryGetProperty("address", out var add) ? add.GetString() ?? "" : "";
+                        p.Port = node.TryGetProperty("port", out var pt) ? pt.GetInt32() : 443;
+                        if (node.TryGetProperty("users", out var users) && users.ValueKind == JsonValueKind.Array)
+                        {
+                            var u = users.EnumerateArray().FirstOrDefault();
+                            if (u.ValueKind == JsonValueKind.Object)
+                            {
+                                p.Uuid = u.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
+                                p.Flow = u.TryGetProperty("flow", out var fl) ? fl.GetString() ?? "" : "";
+                                p.AlterId = u.TryGetProperty("alterId", out var aid) ? aid.GetInt32() : 0;
+                                if (u.TryGetProperty("security", out var sec)) p.Security = sec.GetString() ?? "auto";
+                            }
+                        }
+                    }
+                }
+                else if (settings.TryGetProperty("servers", out var servers) && servers.ValueKind == JsonValueKind.Array)
+                {
+                    var srv = servers.EnumerateArray().FirstOrDefault();
+                    if (srv.ValueKind == JsonValueKind.Object)
+                    {
+                        p.Address = srv.TryGetProperty("address", out var add) ? add.GetString() ?? "" : "";
+                        p.Port = srv.TryGetProperty("port", out var pt) ? pt.GetInt32() : 443;
+                        p.Password = srv.TryGetProperty("password", out var pw) ? pw.GetString() ?? "" : "";
+                        if (srv.TryGetProperty("method", out var md)) p.Method = md.GetString() ?? p.Method;
+                    }
+                }
+            }
+
+            if (ob.TryGetProperty("streamSettings", out var stream))
+            {
+                if (stream.TryGetProperty("network", out var net))
+                    p.Transport = net.GetString()?.ToLowerInvariant() ?? "tcp";
+
+                string streamSec = stream.TryGetProperty("security", out var sc) ? sc.GetString()?.ToLowerInvariant() ?? "" : "";
+                if (!string.IsNullOrEmpty(streamSec) && streamSec != "none")
+                {
+                    if (p.Protocol != "vmess") p.Security = streamSec;
+                    else if (streamSec == "tls") p.Security = "tls";
+                }
+
+                if (stream.TryGetProperty("tlsSettings", out var tls))
+                {
+                    if (tls.TryGetProperty("serverName", out var sn)) p.Sni = sn.GetString() ?? "";
+                    if (tls.TryGetProperty("fingerprint", out var fp)) p.Fp = fp.GetString() ?? p.Fp;
+                    if (tls.TryGetProperty("allowInsecure", out var ins)) p.Insecure = ins.GetBoolean();
+                    if (tls.TryGetProperty("alpn", out var alpn) && alpn.ValueKind == JsonValueKind.Array)
+                        p.Alpn = string.Join(",", alpn.EnumerateArray().Select(x => x.GetString()).Where(x => !string.IsNullOrEmpty(x)));
+                }
+
+                if (stream.TryGetProperty("realitySettings", out var reality))
+                {
+                    if (reality.TryGetProperty("serverName", out var sn)) p.Sni = sn.GetString() ?? "";
+                    if (reality.TryGetProperty("fingerprint", out var fp)) p.Fp = fp.GetString() ?? p.Fp;
+                    if (reality.TryGetProperty("publicKey", out var pbk)) p.Pbk = pbk.GetString() ?? "";
+                    if (reality.TryGetProperty("shortId", out var sid)) p.Sid = sid.GetString() ?? "";
+                }
+
+                if (stream.TryGetProperty("wsSettings", out var ws))
+                {
+                    p.Path = ws.TryGetProperty("path", out var wp) ? wp.GetString() ?? "" : "";
+                    if (ws.TryGetProperty("headers", out var hd) && hd.TryGetProperty("Host", out var wh)) p.Host = wh.GetString() ?? "";
+                    if (string.IsNullOrEmpty(p.Host) && ws.TryGetProperty("host", out var wh2)) p.Host = wh2.GetString() ?? "";
+                }
+                else if (stream.TryGetProperty("grpcSettings", out var grpc))
+                {
+                    p.Path = grpc.TryGetProperty("serviceName", out var snm) ? snm.GetString() ?? "" : "";
+                }
+                else if (stream.TryGetProperty("httpupgradeSettings", out var hu))
+                {
+                    p.Path = hu.TryGetProperty("path", out var hp) ? hp.GetString() ?? "" : "";
+                    p.Host = hu.TryGetProperty("host", out var hh) ? hh.GetString() ?? "" : "";
+                }
+            }
+
+            return string.IsNullOrEmpty(p.Address) ? null : p;
+        }
+        catch { return null; }
+    }
+
     private void ShowQROverlay(string link)
     {
         _currentQrLink = link;
@@ -1594,7 +5185,7 @@ public partial class MainWindow : Window
 
         if (link.Length > 800)
         {
-            ShowNotification(GetString("Lang_ErrQrTooLong"), true);
+            ShowNotification(L("NotifyQrTooLong"), true);
         }
         else
         {
@@ -1621,7 +5212,7 @@ public partial class MainWindow : Window
             }
             catch (Exception)
             {
-                ShowNotification(GetString("Lang_ErrQrGen"), true);
+                ShowNotification(L("NotifyQrError"), true);
             }
         }
 
@@ -1648,9 +5239,94 @@ public partial class MainWindow : Window
         if (!string.IsNullOrEmpty(_currentQrLink))
         {
             Clipboard.SetText(_currentQrLink);
-            ShowNotification(GetString("Lang_MsgCopied"));
+            ShowNotification(L("NotifyCopied"));
             CloseQROverlay();
         }
+    }
+
+    private void UpdateBypassRuVisibility(bool show, bool animate)
+    {
+        if (BypassRuContainer == null || BypassRuScale == null || BypassRuTransform == null) return;
+
+        if (!animate)
+        {
+            BypassRuContainer.BeginAnimation(OpacityProperty, null);
+            BypassRuScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+            BypassRuTransform.BeginAnimation(TranslateTransform.YProperty, null);
+
+            BypassRuScale.ScaleY = show ? 1.0 : 0.0;
+            BypassRuContainer.Opacity = show ? 1.0 : 0.0;
+            BypassRuTransform.Y = show ? 0.0 : 14.0;
+            BypassRuContainer.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+            return;
+        }
+
+        if (show)
+        {
+            if (BypassRuContainer.Visibility != Visibility.Visible)
+            {
+                BypassRuScale.ScaleY = 0.0;
+                BypassRuContainer.Opacity = 0.0;
+                BypassRuTransform.Y = 14.0;
+                BypassRuContainer.Visibility = Visibility.Visible;
+            }
+            var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+
+            BypassRuScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation
+            {
+                To = 1.0,
+                Duration = GetDuration(0.25),
+                EasingFunction = ease
+            });
+            BypassRuContainer.BeginAnimation(OpacityProperty, new DoubleAnimation
+            {
+                To = 1.0,
+                Duration = GetDuration(0.22),
+                EasingFunction = ease
+            });
+            BypassRuTransform.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation
+            {
+                To = 0.0,
+                Duration = GetDuration(0.25),
+                EasingFunction = ease
+            });
+        }
+        else
+        {
+            var ease = new CubicEase { EasingMode = EasingMode.EaseIn };
+
+            var scaleAnim = new DoubleAnimation
+            {
+                To = 0.0,
+                Duration = GetDuration(0.22),
+                EasingFunction = ease
+            };
+            scaleAnim.Completed += (_, _) =>
+            {
+                if (CmbRouteMode != null && CmbRouteMode.SelectedIndex != 0)
+                    BypassRuContainer.Visibility = Visibility.Collapsed;
+            };
+
+            BypassRuScale.BeginAnimation(ScaleTransform.ScaleYProperty, scaleAnim);
+            BypassRuContainer.BeginAnimation(OpacityProperty, new DoubleAnimation
+            {
+                To = 0.0,
+                Duration = GetDuration(0.18),
+                EasingFunction = ease
+            });
+            BypassRuTransform.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation
+            {
+                To = 14.0,
+                Duration = GetDuration(0.22),
+                EasingFunction = ease
+            });
+        }
+    }
+
+    private void CmbRouteMode_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isUpdatingRouting || CmbRouteMode == null) return;
+        UpdateBypassRuVisibility(CmbRouteMode.SelectedIndex == 0, animate: true);
     }
 
     private void BtnOpenRouting_Click(object sender, RoutedEventArgs e)
@@ -1661,8 +5337,13 @@ public partial class MainWindow : Window
         RoutingAppsList.Clear();
         foreach (var a in _currentSettings.RoutingApps) RoutingAppsList.Add(a);
 
+        _isUpdatingRouting = true;
         if (OverlayRouting != null) OverlayRouting.Visibility = Visibility.Visible;
-        if (CmbRouteMode != null) CmbRouteMode.SelectedIndex = _currentSettings.RouteMode == "Only" ? 1 : 0;
+        if (ChkBypassRu != null) ChkBypassRu.IsChecked = _currentSettings.BypassRuDomains;
+        bool isOnlyMode = _currentSettings.RouteMode == "Only";
+        if (CmbRouteMode != null) CmbRouteMode.SelectedIndex = isOnlyMode ? 1 : 0;
+        UpdateBypassRuVisibility(!isOnlyMode, animate: false);
+        _isUpdatingRouting = false;
 
         OverlayRoutingBg?.BeginAnimation(OpacityProperty, new DoubleAnimation { To = 1, Duration = GetDuration(0.2) });
         OverlayRoutingCard?.BeginAnimation(OpacityProperty, new DoubleAnimation { To = 1, Duration = GetDuration(0.2) });
@@ -1673,20 +5354,24 @@ public partial class MainWindow : Window
     {
         if (saveChanges)
         {
-            bool modeChanged = (_currentSettings.RouteMode == "Only") != (CmbRouteMode?.SelectedIndex == 1);
+            bool isOnlyMode = CmbRouteMode?.SelectedIndex == 1;
+            bool newBypassRu = !isOnlyMode ? (ChkBypassRu?.IsChecked ?? false) : _currentSettings.BypassRuDomains;
+            bool bypassRuChanged = !isOnlyMode && _currentSettings.BypassRuDomains != newBypassRu;
+            bool modeChanged = (_currentSettings.RouteMode == "Only") != isOnlyMode;
             var domainsChanged = !new HashSet<string>(_currentSettings.RoutingDomains).SetEquals(RoutingDomainsList);
             var appsChanged = !new HashSet<string>(_currentSettings.RoutingApps).SetEquals(RoutingAppsList);
 
-            if (modeChanged || domainsChanged || appsChanged)
+            if (bypassRuChanged || modeChanged || domainsChanged || appsChanged)
             {
-                _currentSettings.RouteMode = CmbRouteMode?.SelectedIndex == 1 ? "Only" : "Bypass";
+                _currentSettings.BypassRuDomains = newBypassRu;
+                _currentSettings.RouteMode = isOnlyMode ? "Only" : "Bypass";
                 _currentSettings.RoutingDomains = RoutingDomainsList.ToList();
                 _currentSettings.RoutingApps = RoutingAppsList.ToList();
                 SaveSettings();
 
                 if (_isRunning)
                 {
-                    ShowNotification(GetString("Lang_MsgRoutesChanged"));
+                    ShowNotification(L("NotifyRoutesReconnecting"));
                     _ = RestartVpnAsync();
                 }
             }
@@ -1716,7 +5401,22 @@ public partial class MainWindow : Window
     private void BtnAddDomain_Click(object? sender, RoutedEventArgs? e)
     {
         if (TxtNewDomain == null) return;
-        string domain = TxtNewDomain.Text.Trim().ToLower();
+        string domain = TxtNewDomain.Text.Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(domain)) return;
+
+        if (!IsIpOrCidr(domain))
+        {
+            if ((domain.StartsWith("http://") || domain.StartsWith("https://")) && Uri.TryCreate(domain, UriKind.Absolute, out var uri) && !string.IsNullOrEmpty(uri.Host))
+                domain = uri.Host.ToLowerInvariant();
+            else
+            {
+                int slash = domain.IndexOf('/');
+                if (slash > 0) domain = domain[..slash];
+            }
+            if (domain.StartsWith("*.")) domain = domain[2..];
+            domain = domain.Trim().Trim('.');
+        }
+
         if (!string.IsNullOrEmpty(domain) && !RoutingDomainsList.Contains(domain))
         {
             RoutingDomainsList.Add(domain);
@@ -1727,7 +5427,7 @@ public partial class MainWindow : Window
     private void BtnAddApp_Click(object? sender, RoutedEventArgs? e)
     {
         if (TxtNewApp == null) return;
-        string app = TxtNewApp.Text.Trim().ToLower();
+        string app = TxtNewApp.Text.Trim().ToLowerInvariant();
         if (!string.IsNullOrEmpty(app) && !RoutingAppsList.Contains(app))
         {
             if (!app.EndsWith(".exe")) app += ".exe";
@@ -1752,7 +5452,7 @@ public partial class MainWindow : Window
 
         string text = Clipboard.GetText().Trim();
         var lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-        bool addedAny = false;
+        VpnProfile? lastAdded = null;
 
         foreach (var line in lines)
         {
@@ -1760,22 +5460,23 @@ public partial class MainWindow : Window
             if (ParseLinkIntoProfile(p, line) && !string.IsNullOrEmpty(p.Address))
             {
                 _profiles.Add(p);
+                _standaloneProfiles.Add(p);
                 _ = p.CheckPingAsync();
-                addedAny = true;
+                lastAdded = p;
             }
         }
 
-        if (addedAny)
+        if (lastAdded != null)
         {
             SaveSettings();
             UpdateEmptyState();
-            if (LvProfiles != null) LvProfiles.SelectedIndex = _profiles.Count - 1;
-            ShowNotification(GetString("Lang_MsgImportOk"));
+            if (LvProfiles != null) LvProfiles.SelectedItem = lastAdded;
+            ShowNotification(L("NotifyImported"));
             CloseImportOverlay();
         }
         else
         {
-            ShowNotification(GetString("Lang_ErrImport"), true);
+            ShowNotification(L("NotifyImportError"), true);
         }
     }
 
@@ -1792,27 +5493,30 @@ public partial class MainWindow : Window
 
         if (!keepValues) _manualInputValues.Clear();
 
-        AddManualField("Name", GetString("Lang_FldName"));
-        AddManualField("Address", GetString("Lang_FldAddress"));
-        AddManualField("Port", GetString("Lang_FldPort"));
+        AddManualField("Name", L("FieldName"));
+        AddManualField("Address", L("FieldAddress"));
+        AddManualField("Port", L("FieldPort"));
 
         if (protocol is "vless" or "trojan" or "vmess" or "tuic" or "hysteria" or "hysteria2")
         {
             AddManualField(protocol is "trojan" || protocol.StartsWith("hysteria") ? "Password" : "Uuid",
-                           protocol is "trojan" || protocol.StartsWith("hysteria") ? GetString("Lang_FldPassword") : GetString("Lang_FldUuid"));
+                           protocol is "trojan" || protocol.StartsWith("hysteria") ? L("FieldPassword") : L("FieldUuid"));
 
-            AddManualField("Sni", GetString("Lang_FldSni"));
-            if (protocol is not "vmess" and not "tuic") AddManualField("Fp", GetString("Lang_FldFp"));
-            AddManualField("Insecure", GetString("Lang_FldInsecure"));
+            if (protocol == "tuic") AddManualField("Password", L("FieldPassword"));
+
+            AddManualField("Sni", L("FieldSni"));
+            if (protocol is "vless" or "trojan" or "vmess") AddManualField("Fp", L("FieldFp"));
+            AddManualField("Insecure", L("FieldInsecure"));
         }
 
-        if (protocol == "vless") { AddManualField("Flow", GetString("Lang_FldFlow")); AddManualField("Pbk", GetString("Lang_FldPbk")); AddManualField("Sid", GetString("Lang_FldSid")); }
-        if (protocol == "vmess") { AddManualField("Transport", GetString("Lang_FldTransport")); AddManualField("Path", GetString("Lang_FldPath")); AddManualField("Host", GetString("Lang_FldHost")); AddManualField("Security", GetString("Lang_FldSecurity")); AddManualField("AlterId", GetString("Lang_FldAlterId")); }
-        if (protocol == "shadowsocks") { AddManualField("Method", GetString("Lang_FldMethod")); AddManualField("Password", GetString("Lang_FldPassword")); }
-        if (protocol == "wireguard") { AddManualField("PublicKey", GetString("Lang_FldPubKey")); AddManualField("PrivateKey", GetString("Lang_FldPrivKey")); AddManualField("LocalAddress", GetString("Lang_FldLocalAddr")); AddManualField("Mtu", GetString("Lang_FldMtu")); }
-        if (protocol is "hysteria" or "hysteria2" or "tuic") { AddManualField("Alpn", GetString("Lang_FldAlpn")); AddManualField("Up", GetString("Lang_FldUpMbps")); AddManualField("Down", GetString("Lang_FldDownMbps")); }
-        if (protocol is "hysteria" or "hysteria2") { AddManualField("Obfs", GetString("Lang_FldObfs")); AddManualField("ObfsPassword", GetString("Lang_FldObfsPass")); }
-        if (protocol is "socks" or "http") { AddManualField("Uuid", GetString("Lang_FldUuid")); AddManualField("Password", GetString("Lang_FldPassword")); }
+        if (protocol == "vless") { AddManualField("Flow", L("FieldFlow")); AddManualField("Pbk", L("FieldPbk")); AddManualField("Sid", L("FieldSid")); AddManualField("Transport", L("FieldTransport")); AddManualField("Path", L("FieldPath")); AddManualField("Host", L("FieldHost")); }
+        if (protocol == "trojan") { AddManualField("Transport", L("FieldTransport")); AddManualField("Path", L("FieldPath")); AddManualField("Host", L("FieldHost")); }
+        if (protocol == "vmess") { AddManualField("Transport", L("FieldTransport")); AddManualField("Path", L("FieldPath")); AddManualField("Host", L("FieldHost")); AddManualField("Security", L("FieldSecurity")); AddManualField("AlterId", L("FieldAlterId")); }
+        if (protocol == "shadowsocks") { AddManualField("Method", L("FieldMethod")); AddManualField("Password", L("FieldPassword")); }
+        if (protocol == "wireguard") { AddManualField("PublicKey", L("FieldPublicKey")); AddManualField("PrivateKey", L("FieldPrivateKey")); AddManualField("LocalAddress", L("FieldLocalAddress")); AddManualField("Mtu", L("FieldMtu")); }
+        if (protocol is "hysteria" or "hysteria2" or "tuic") { AddManualField("Alpn", L("FieldAlpn")); AddManualField("Up", L("FieldUp")); AddManualField("Down", L("FieldDown")); }
+        if (protocol is "hysteria" or "hysteria2") { AddManualField("Obfs", L("FieldObfs")); AddManualField("ObfsPassword", L("FieldObfsPassword")); }
+        if (protocol is "socks" or "http") { AddManualField("Uuid", L("FieldUuid")); AddManualField("Password", L("FieldPassword")); }
     }
 
     private void AddManualField(string key, string labelText)
@@ -1833,9 +5537,9 @@ public partial class MainWindow : Window
         FrameworkElement inputElement;
         var dropdownOptions = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
         {
-            { "Fp", new[] { "chrome", "firefox", "safari", "edge", "ios", "android", "360", "random", "randomized" } },
+            { "Fp", new[] { "chrome", "firefox", "safari", "edge", "ios", "android", "360", "random", "randomized", "" } },
             { "Security", new[] { "auto", "none", "tls" } },
-            { "Transport", new[] { "tcp", "ws", "grpc", "http" } },
+            { "Transport", new[] { "tcp", "ws", "grpc", "http", "httpupgrade" } },
             { "Flow", new[] { "", "xtls-rprx-vision" } }
         };
 
@@ -1921,13 +5625,13 @@ public partial class MainWindow : Window
 
         if (string.IsNullOrWhiteSpace(p.Address) || p.Address.Contains(' '))
         {
-            ShowNotification(GetString("Lang_ErrInvalidAddress"), true);
+            ShowNotification(L("NotifyInvalidAddress"), true);
             return;
         }
 
         if (!int.TryParse(portStr, out int port) || port is < 1 or > 65535)
         {
-            ShowNotification(GetString("Lang_ErrInvalidPort"), true);
+            ShowNotification(L("NotifyInvalidPort"), true);
             return;
         }
         p.Port = port;
@@ -1935,7 +5639,7 @@ public partial class MainWindow : Window
         p.Uuid = _manualInputValues.GetValueOrDefault("Uuid", "");
         p.Password = _manualInputValues.GetValueOrDefault("Password", "");
         p.Sni = _manualInputValues.GetValueOrDefault("Sni", "");
-        p.Fp = _manualInputValues.GetValueOrDefault("Fp", "");
+        p.Fp = p.Protocol is "hysteria" or "hysteria2" or "tuic" ? "" : _manualInputValues.GetValueOrDefault("Fp", "");
         p.Flow = _manualInputValues.GetValueOrDefault("Flow", "");
         p.Pbk = _manualInputValues.GetValueOrDefault("Pbk", "");
         p.Sid = _manualInputValues.GetValueOrDefault("Sid", "");
@@ -1959,33 +5663,62 @@ public partial class MainWindow : Window
         p.Down = _manualInputValues.GetValueOrDefault("Down", "");
         p.Obfs = _manualInputValues.GetValueOrDefault("Obfs", "");
         p.ObfsPassword = _manualInputValues.GetValueOrDefault("ObfsPassword", "");
+        p.Link = "";
 
-        if (_editingProfile == null)
+        bool isNewProfile = _editingProfile == null;
+        bool editedActive = _editingProfile != null && ActiveProfile == _editingProfile;
+
+        if (isNewProfile)
         {
             _profiles.Add(p);
-            if (LvProfiles != null) LvProfiles.SelectedIndex = _profiles.Count - 1;
+            _standaloneProfiles.Add(p);
+            _isUpdatingSettings = true;
+            if (LvProfiles != null) LvProfiles.SelectedItem = p;
+            _isUpdatingSettings = false;
+            ActiveProfile = p;
         }
-        else
+        else if (_editingProfile != null)
         {
             int index = _profiles.IndexOf(_editingProfile);
             if (index >= 0)
             {
+                p.SubscriptionId = _editingProfile.SubscriptionId;
+                p.SubscriptionName = _editingProfile.SubscriptionName;
                 _profiles[index] = p;
-                if (LvProfiles != null) LvProfiles.SelectedIndex = index;
+
+                int sIndex = _standaloneProfiles.IndexOf(_editingProfile);
+                if (sIndex >= 0) _standaloneProfiles[sIndex] = p;
+
+                if (editedActive || LvProfiles?.SelectedItem == _editingProfile)
+                {
+                    _isUpdatingSettings = true;
+                    if (LvProfiles != null && sIndex >= 0) LvProfiles.SelectedItem = p;
+                    _isUpdatingSettings = false;
+                }
             }
+            if (editedActive) ActiveProfile = p;
         }
 
+        _editingProfile = null;
+        RefreshAllVisualIndicators();
         UpdateEmptyState();
         PingManager.Clear();
         _ = p.CheckPingAsync();
         SaveSettings();
         CloseImportOverlay();
+
+        if (editedActive && _isRunning)
+        {
+            ShowNotification(L("NotifyProfileUpdatedReconnecting"));
+            _ = RestartVpnAsync();
+        }
     }
 
     private static bool ParseLinkIntoProfile(VpnProfile p, string link)
     {
         link = link.Trim();
         p.Link = link;
+        p.Fp = "";
         var allowed = new HashSet<string> { "vless", "vmess", "trojan", "shadowsocks", "ss", "wireguard", "wg", "hysteria", "hysteria2", "hy2", "tuic", "socks", "socks5", "http" };
 
         try
@@ -1993,28 +5726,60 @@ public partial class MainWindow : Window
             if (link.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase))
             {
                 p.Protocol = "vmess";
-                string b64 = link[8..];
-                int mod4 = b64.Length % 4;
-                if (mod4 > 0) b64 += new string('=', 4 - mod4);
+                string decodedJson = SafeBase64Decode(link[8..]);
+                if (string.IsNullOrEmpty(decodedJson)) return false;
 
-                using var doc = JsonDocument.Parse(Convert.FromBase64String(b64));
+                using var doc = JsonDocument.Parse(decodedJson);
                 var root = doc.RootElement;
 
                 p.Name = root.TryGetProperty("ps", out var ps) ? ps.GetString() ?? "VMESS" : "VMESS";
                 p.Address = root.TryGetProperty("add", out var add) ? add.GetString() ?? "" : "";
                 p.Port = root.TryGetProperty("port", out var pt) ? (pt.ValueKind == JsonValueKind.Number ? pt.GetInt32() : int.Parse(pt.ToString()!)) : 443;
                 p.Uuid = root.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
-                p.Transport = root.TryGetProperty("net", out var net) ? net.GetString() ?? "tcp" : "tcp";
+                p.Transport = root.TryGetProperty("net", out var net) ? (net.GetString() ?? "tcp").ToLowerInvariant() : "tcp";
+                if (p.Transport == "h2") p.Transport = "http";
                 p.Sni = root.TryGetProperty("sni", out var sni) ? sni.GetString() ?? "" : "";
                 p.Path = root.TryGetProperty("path", out var path) ? path.GetString() ?? "" : "";
                 p.Host = root.TryGetProperty("host", out var host) ? host.GetString() ?? "" : "";
-                p.Security = root.TryGetProperty("tls", out var tls) && tls.GetString() == "tls" ? "tls" : "";
+                p.Fp = root.TryGetProperty("fp", out var fp) ? fp.GetString() ?? "" : "";
+                p.Alpn = root.TryGetProperty("alpn", out var alpn) ? alpn.GetString() ?? "" : "";
+                if (root.TryGetProperty("aid", out var aid))
+                    p.AlterId = aid.ValueKind == JsonValueKind.Number ? aid.GetInt32() : (int.TryParse(aid.ToString(), out int aidVal) ? aidVal : 0);
+
+                string vmessTls = root.TryGetProperty("tls", out var tls) ? tls.GetString() ?? "" : "";
+                string vmessScy = root.TryGetProperty("scy", out var scy) ? scy.GetString() ?? "" : "";
+                p.Security = vmessTls.Equals("tls", StringComparison.OrdinalIgnoreCase)
+                    ? "tls"
+                    : (string.IsNullOrEmpty(vmessScy) ? "auto" : vmessScy);
+                if (p.Security == "tls" && string.IsNullOrEmpty(p.Sni) && !string.IsNullOrEmpty(p.Host))
+                    p.Sni = p.Host;
+                if (root.TryGetProperty("allowInsecure", out var vmessIns))
+                {
+                    string insStr = vmessIns.ToString();
+                    p.Insecure = vmessIns.ValueKind == JsonValueKind.True || insStr == "1" || insStr.Equals("true", StringComparison.OrdinalIgnoreCase);
+                }
+
                 return true;
+            }
+
+            if (link.StartsWith("ss://", StringComparison.OrdinalIgnoreCase))
+            {
+                int hashIdx = link.IndexOf('#');
+                string body = hashIdx >= 0 ? link[5..hashIdx] : link[5..];
+                if (!body.Contains('@'))
+                {
+                    string frag = hashIdx >= 0 ? Uri.UnescapeDataString(link[(hashIdx + 1)..]) : "";
+                    string decoded = SafeBase64Decode(body);
+                    if (decoded.Contains('@'))
+                    {
+                        link = $"ss://{decoded}" + (string.IsNullOrEmpty(frag) ? "" : $"#{Uri.EscapeDataString(frag)}");
+                    }
+                }
             }
 
             if (!Uri.TryCreate(link, UriKind.Absolute, out var uri)) return false;
 
-            p.Protocol = uri.Scheme.ToLower();
+            p.Protocol = uri.Scheme.ToLowerInvariant();
             if (!allowed.Contains(p.Protocol)) return false;
 
             p.Protocol = p.Protocol switch
@@ -2026,8 +5791,9 @@ public partial class MainWindow : Window
                 _ => p.Protocol
             };
 
-            p.Address = uri.Host;
-            p.Port = uri.Port > 0 ? uri.Port : 443;
+            p.Address = uri.IdnHost.Trim('[', ']');
+            if (string.IsNullOrEmpty(p.Address)) p.Address = uri.Host.Trim('[', ']');
+            p.Port = uri.Port > 0 ? uri.Port : (p.Protocol == "wireguard" ? 51820 : 443);
             p.Name = Uri.UnescapeDataString(uri.GetComponents(UriComponents.Fragment, UriFormat.Unescaped));
             if (string.IsNullOrEmpty(p.Name)) p.Name = p.Address;
 
@@ -2036,6 +5802,7 @@ public partial class MainWindow : Window
             {
                 if (p.Protocol is "vless" or "tuic") p.Uuid = userInfo.Split(':')[0];
                 if (p.Protocol is "trojan" or "hysteria2" or "hysteria") p.Password = userInfo;
+                if (p.Protocol == "wireguard") p.PrivateKey = userInfo;
                 if (p.Protocol == "shadowsocks")
                 {
                     string decoded = userInfo;
@@ -2053,7 +5820,7 @@ public partial class MainWindow : Window
                     var parts = decoded.Split(':', 2);
                     if (parts.Length == 2) { p.Method = parts[0]; p.Password = parts[1]; }
                 }
-                if (p.Protocol == "tuic" && userInfo.Contains(':')) p.Password = userInfo.Split(':')[1];
+                if (p.Protocol == "tuic" && userInfo.Contains(':')) p.Password = userInfo.Split(':', 2)[1];
                 if (p.Protocol is "http" or "socks")
                 {
                     var parts = userInfo.Split(':', 2);
@@ -2063,17 +5830,74 @@ public partial class MainWindow : Window
             }
 
             var q = ParseQueryString(uri.Query);
-            p.Sni = q.GetValueOrDefault("sni", "");
+            p.Sni = q.TryGetValue("sni", out var sniVal) ? sniVal : q.GetValueOrDefault("peer", "");
             p.Pbk = q.GetValueOrDefault("pbk", "");
             p.Sid = q.GetValueOrDefault("sid", "");
-            p.Fp = q.GetValueOrDefault("fp", "");
+            p.Fp = p.Protocol is "hysteria" or "hysteria2" or "tuic" ? "" : q.GetValueOrDefault("fp", "");
             p.Flow = q.GetValueOrDefault("flow", "");
+            if (p.Flow.EndsWith("-udp443", StringComparison.OrdinalIgnoreCase))
+                p.Flow = p.Flow[..^7];
+
             p.Alpn = q.GetValueOrDefault("alpn", "");
             p.Method = q.GetValueOrDefault("method", p.Method);
 
+            if (p.Protocol == "hysteria")
+            {
+                if (string.IsNullOrEmpty(p.Password) && q.TryGetValue("auth", out var authVal)) p.Password = authVal;
+                if (q.TryGetValue("upmbps", out var upM)) p.Up = upM;
+                else if (q.TryGetValue("up", out var up)) p.Up = up;
+                if (q.TryGetValue("downmbps", out var dnM)) p.Down = dnM;
+                else if (q.TryGetValue("down", out var dn)) p.Down = dn;
+            }
+            else if (p.Protocol == "hysteria2")
+            {
+                if (q.TryGetValue("up", out var up)) p.Up = up;
+                else if (q.TryGetValue("upmbps", out var upM)) p.Up = upM;
+                if (q.TryGetValue("down", out var dn)) p.Down = dn;
+                else if (q.TryGetValue("downmbps", out var dnM)) p.Down = dnM;
+                if (uri.Port <= 0 && q.TryGetValue("mport", out var mport))
+                {
+                    var mPortMatch = Regex.Match(mport, @"\d+");
+                    if (mPortMatch.Success && int.TryParse(mPortMatch.Value, out int parsedPort) && parsedPort is >= 1 and <= 65535)
+                        p.Port = parsedPort;
+                }
+            }
+            else if (p.Protocol == "wireguard")
+            {
+                if (string.IsNullOrEmpty(p.PrivateKey) && q.TryGetValue("privatekey", out var privKey)) p.PrivateKey = privKey;
+                if (q.TryGetValue("publickey", out var pubKey)) p.PublicKey = pubKey;
+                else if (q.TryGetValue("public_key", out var pubKey2)) p.PublicKey = pubKey2;
+                if (q.TryGetValue("address", out var localAddr)) p.LocalAddress = localAddr;
+                else if (q.TryGetValue("local_address", out var localAddr2)) p.LocalAddress = localAddr2;
+                if (q.TryGetValue("mtu", out var mtuStr) && int.TryParse(mtuStr, out int mtu)) p.Mtu = mtu;
+            }
+
+            if (q.TryGetValue("type", out var typeVal) || q.TryGetValue("net", out typeVal))
+            {
+                p.Transport = typeVal.ToLowerInvariant();
+                if (p.Transport == "h2") p.Transport = "http";
+                else if (p.Transport == "raw") p.Transport = "tcp";
+            }
+
+            if (p.Transport == "tcp" && q.TryGetValue("headerType", out var ht) && ht.Equals("http", StringComparison.OrdinalIgnoreCase))
+                p.Transport = "http";
+
+            if (q.TryGetValue("serviceName", out var snVal))
+                p.Path = snVal;
+            else if (q.TryGetValue("path", out var pathVal))
+                p.Path = pathVal;
+
+            if (q.TryGetValue("host", out var hostVal))
+                p.Host = hostVal;
+
+            if (q.TryGetValue("security", out var secVal))
+                p.Security = secVal.ToLowerInvariant();
+
             if (q.TryGetValue("obfs", out var obfs)) p.Obfs = obfs;
             if (q.TryGetValue("obfs-password", out var opw)) p.ObfsPassword = opw;
-            if (q.TryGetValue("insecure", out var ins) || q.TryGetValue("allowInsecure", out ins))
+            else if (q.TryGetValue("obfsParam", out var opar) && p.Protocol == "hysteria") p.Obfs = opar;
+
+            if (q.TryGetValue("insecure", out var ins) || q.TryGetValue("allowInsecure", out ins) || q.TryGetValue("allow_insecure", out ins))
                 p.Insecure = ins == "1" || ins.Equals("true", StringComparison.OrdinalIgnoreCase);
 
             return true;
@@ -2097,22 +5921,41 @@ public partial class MainWindow : Window
     private async void BtnRefreshPing_Click(object sender, RoutedEventArgs e)
     {
         if (BtnRefreshPing != null) BtnRefreshPing.IsEnabled = false;
-        PingManager.Clear();
+        try
+        {
+            PingManager.Clear();
+            CountryFlagHelper.ClearDownloadState();
 
-        if (!_currentSettings.DisableAnimations && IconRefreshPing?.RenderTransform is RotateTransform transform)
-            transform.BeginAnimation(RotateTransform.AngleProperty, new DoubleAnimation { From = 0, To = 360, Duration = TimeSpan.FromSeconds(1), RepeatBehavior = RepeatBehavior.Forever });
+            if (!_currentSettings.DisableAnimations && IconRefreshPing?.RenderTransform is RotateTransform transform)
+                transform.BeginAnimation(RotateTransform.AngleProperty, new DoubleAnimation { From = 0, To = 360, Duration = TimeSpan.FromSeconds(1), RepeatBehavior = RepeatBehavior.Forever });
 
-        await Task.WhenAll(_profiles.Select(p => p.CheckPingAsync()));
+            foreach (var p in _profiles) p.ResetGeoIpRetry();
+            await Task.WhenAll(_profiles.Select(p => p.CheckPingAsync()));
+        }
+        catch { }
+        finally
+        {
+            if (!_currentSettings.DisableAnimations && IconRefreshPing?.RenderTransform is RotateTransform resetTransform)
+                resetTransform.BeginAnimation(RotateTransform.AngleProperty, null);
 
-        if (!_currentSettings.DisableAnimations && IconRefreshPing?.RenderTransform is RotateTransform resetTransform)
-            resetTransform.BeginAnimation(RotateTransform.AngleProperty, null);
+            if (BtnRefreshPing != null) BtnRefreshPing.IsEnabled = true;
+        }
+    }
 
-        if (BtnRefreshPing != null) BtnRefreshPing.IsEnabled = true;
+    private VpnProfile? GetContextMenuProfile(object? sender)
+    {
+        if (sender is MenuItem { Parent: ContextMenu { PlacementTarget: ListBoxItem { DataContext: VpnProfile p } } })
+            return p;
+        return LvProfiles?.SelectedItem as VpnProfile ?? ActiveProfile;
     }
 
     private void ListBoxItem_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
     {
-        if (sender is ListBoxItem item) { item.IsSelected = true; item.Focus(); }
+        if (sender is ListBoxItem item)
+        {
+            if (!_isRunning) item.IsSelected = true;
+            item.Focus();
+        }
     }
 
     private async void ListBoxItem_MouseDoubleClick(object sender, MouseButtonEventArgs e)
@@ -2122,44 +5965,245 @@ public partial class MainWindow : Window
 
     private async void MenuItem_Connect_Click(object sender, RoutedEventArgs e)
     {
-        if (LvProfiles?.SelectedItem is VpnProfile && !_isRunning) await ToggleVpnAsync();
+        var p = GetContextMenuProfile(sender);
+        if (p == null) return;
+
+        if (LvProfiles != null && LvProfiles.SelectedItem != p)
+        {
+            LvProfiles.SelectedItem = p;
+            return;
+        }
+
+        if (!_isRunning) await ToggleVpnAsync();
+        else if (ActiveProfile != p)
+        {
+            ActiveProfile = p;
+            RefreshAllVisualIndicators();
+            SaveSettings();
+            ShowNotification(L("NotifyReconnectingServer"));
+            await RestartVpnAsync();
+        }
+    }
+
+    private async void MenuItem_UrlTest_Click(object sender, RoutedEventArgs e)
+    {
+        if (GetContextMenuProfile(sender) is { } p)
+        {
+            p.PingText = "...";
+            long time = await RunUrlTestAsync(p);
+            p.SetUrlTestResult(time);
+        }
+    }
+
+    private async Task<long> RunUrlTestAsync(VpnProfile p)
+    {
+        int port = 2081;
+        bool useTempProxy = true;
+
+        if (_isRunning && ActiveProfile == p && _currentSettings.Mode == "Proxy")
+        {
+            useTempProxy = false;
+            port = _runningProxyPort > 0 ? _runningProxyPort : (_currentSettings.ProxyPort > 0 ? _currentSettings.ProxyPort : 2080);
+        }
+
+        Process? tempProcess = null;
+        string tempConfig = "";
+        long result = -1;
+
+        try
+        {
+            if (useTempProxy)
+            {
+                port = FindFreeTcpPort(IPAddress.Loopback);
+                if (port <= 0) port = Random.Shared.Next(10000, 60000);
+                tempConfig = Path.Combine(_exeDirectory, $"temp_{port}.json");
+                string configContent = GenerateJsonConfig(p, "8.8.8.8", "Proxy", port);
+                await File.WriteAllTextAsync(tempConfig, configContent);
+
+                tempProcess = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = Path.Combine(_exeDirectory, "sing-box.exe"),
+                        Arguments = $"run -c \"{tempConfig}\"",
+                        WorkingDirectory = _exeDirectory,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    }
+                };
+                tempProcess.Start();
+                JobObjectManager.AddProcess(tempProcess.Handle);
+
+                bool portReady = false;
+                for (int i = 0; i < 20; i++)
+                {
+                    if (tempProcess.HasExited) return -1;
+                    try
+                    {
+                        using var probe = new TcpClient();
+                        await probe.ConnectAsync(IPAddress.Loopback, port).WaitAsync(TimeSpan.FromMilliseconds(200));
+                        portReady = true;
+                        break;
+                    }
+                    catch
+                    {
+                        await Task.Delay(150);
+                    }
+                }
+
+                if (!portReady && tempProcess.HasExited) return -1;
+            }
+
+            using var handler = new HttpClientHandler { Proxy = new WebProxy("127.0.0.1", port), UseProxy = true };
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(5) };
+            var sw = Stopwatch.StartNew();
+            var response = await client.GetAsync("http://cp.cloudflare.com/generate_204");
+            sw.Stop();
+            if (response.IsSuccessStatusCode) result = sw.ElapsedMilliseconds;
+        }
+        catch { }
+        finally
+        {
+            if (useTempProxy && tempProcess != null)
+            {
+                try { tempProcess.Kill(true); tempProcess.WaitForExit(1000); } catch { }
+                tempProcess.Dispose();
+            }
+            if (!string.IsNullOrEmpty(tempConfig))
+            {
+                try { File.Delete(tempConfig); } catch { }
+            }
+        }
+
+        return result;
+    }
+
+    private static string BuildShareLink(VpnProfile p)
+    {
+        if (!string.IsNullOrEmpty(p.Link)) return p.Link;
+
+        string frag = string.IsNullOrEmpty(p.Name) ? "" : $"#{Uri.EscapeDataString(p.Name)}";
+        if (p.Protocol == "shadowsocks")
+        {
+            string creds = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes($"{p.Method}:{p.Password}"));
+            return $"ss://{creds}@{p.Address}:{p.Port}{frag}";
+        }
+
+        var qp = new List<string>();
+        void AddQ(string k, string? v)
+        {
+            if (!string.IsNullOrEmpty(v)) qp.Add($"{k}={Uri.EscapeDataString(v)}");
+        }
+
+        if (p.Protocol == "vless")
+        {
+            AddQ("security", !string.IsNullOrEmpty(p.Pbk) ? "reality" : (string.IsNullOrEmpty(p.Security) ? "none" : p.Security));
+            AddQ("type", string.IsNullOrEmpty(p.Transport) ? "tcp" : p.Transport);
+            AddQ("sni", p.Sni);
+            AddQ("fp", p.Fp);
+            AddQ("pbk", p.Pbk);
+            AddQ("sid", p.Sid);
+            AddQ("flow", p.Flow);
+            AddQ("alpn", p.Alpn);
+            AddQ("path", p.Path);
+            AddQ("host", p.Host);
+            if (p.Insecure) AddQ("allowInsecure", "1");
+            string qs = qp.Count > 0 ? "?" + string.Join("&", qp) : "";
+            return $"vless://{Uri.EscapeDataString(p.Uuid)}@{p.Address}:{p.Port}{qs}{frag}";
+        }
+
+        if (p.Protocol == "trojan")
+        {
+            AddQ("security", string.IsNullOrEmpty(p.Security) ? "tls" : p.Security);
+            AddQ("type", string.IsNullOrEmpty(p.Transport) ? "tcp" : p.Transport);
+            AddQ("sni", p.Sni);
+            AddQ("fp", p.Fp);
+            AddQ("alpn", p.Alpn);
+            AddQ("path", p.Path);
+            AddQ("host", p.Host);
+            if (p.Insecure) AddQ("allowInsecure", "1");
+            string qs = qp.Count > 0 ? "?" + string.Join("&", qp) : "";
+            return $"trojan://{Uri.EscapeDataString(p.Password)}@{p.Address}:{p.Port}{qs}{frag}";
+        }
+
+        if (p.Protocol is "hysteria2" or "hysteria")
+        {
+            AddQ("sni", p.Sni);
+            AddQ("alpn", p.Alpn);
+            AddQ("obfs", p.Obfs);
+            AddQ("obfs-password", p.ObfsPassword);
+            AddQ("up", p.Up);
+            AddQ("down", p.Down);
+            if (p.Insecure) AddQ("insecure", "1");
+            string qs = qp.Count > 0 ? "?" + string.Join("&", qp) : "";
+            string scheme = p.Protocol == "hysteria2" ? "hysteria2" : "hysteria";
+            return $"{scheme}://{Uri.EscapeDataString(p.Password)}@{p.Address}:{p.Port}{qs}{frag}";
+        }
+
+        if (p.Protocol == "tuic")
+        {
+            AddQ("sni", p.Sni);
+            AddQ("alpn", p.Alpn);
+            AddQ("congestion_control", "bbr");
+            if (p.Insecure) AddQ("allow_insecure", "1");
+            string qs = qp.Count > 0 ? "?" + string.Join("&", qp) : "";
+            string user = string.IsNullOrEmpty(p.Password) ? Uri.EscapeDataString(p.Uuid) : $"{Uri.EscapeDataString(p.Uuid)}:{Uri.EscapeDataString(p.Password)}";
+            return $"tuic://{user}@{p.Address}:{p.Port}{qs}{frag}";
+        }
+
+        if (p.Protocol == "wireguard")
+        {
+            AddQ("publickey", p.PublicKey);
+            AddQ("address", p.LocalAddress);
+            if (p.Mtu > 0) AddQ("mtu", p.Mtu.ToString());
+            string qs = qp.Count > 0 ? "?" + string.Join("&", qp) : "";
+            return $"wireguard://{Uri.EscapeDataString(p.PrivateKey)}@{p.Address}:{p.Port}{qs}{frag}";
+        }
+
+        return $"{p.Protocol}://{(string.IsNullOrEmpty(p.Uuid) ? p.Password : p.Uuid)}@{p.Address}:{p.Port}{frag}";
     }
 
     private void MenuItem_CopyLink_Click(object sender, RoutedEventArgs e)
     {
-        if (LvProfiles?.SelectedItem is VpnProfile p)
+        if (GetContextMenuProfile(sender) is { } p)
         {
-            string link = p.Link;
-            if (string.IsNullOrEmpty(link))
-            {
-                link = $"{p.Protocol}://{(string.IsNullOrEmpty(p.Uuid) ? p.Password : p.Uuid)}@{p.Address}:{p.Port}#{p.Name}";
-                if (p.Protocol == "shadowsocks") link = $"ss://{p.Method}:{p.Password}@{p.Address}:{p.Port}#{p.Name}";
-            }
-            ShowQROverlay(link);
+            ShowQROverlay(BuildShareLink(p));
         }
     }
 
     private void MenuItem_MoveUp_Click(object sender, RoutedEventArgs e)
     {
-        if (LvProfiles?.SelectedItem is VpnProfile p)
+        if (GetContextMenuProfile(sender) is { } p)
         {
-            int idx = _profiles.IndexOf(p);
-            if (idx > 0) { _profiles.Move(idx, idx - 1); SaveSettings(); }
+            int idx = _standaloneProfiles.IndexOf(p);
+            if (idx > 0)
+            {
+                _standaloneProfiles.Move(idx, idx - 1);
+                int allIdx = _profiles.IndexOf(p);
+                if (allIdx > 0) _profiles.Move(allIdx, allIdx - 1);
+                SaveSettings();
+            }
         }
     }
 
     private void MenuItem_MoveDown_Click(object sender, RoutedEventArgs e)
     {
-        if (LvProfiles?.SelectedItem is VpnProfile p)
+        if (GetContextMenuProfile(sender) is { } p)
         {
-            int idx = _profiles.IndexOf(p);
-            if (idx >= 0 && idx < _profiles.Count - 1) { _profiles.Move(idx, idx + 1); SaveSettings(); }
+            int idx = _standaloneProfiles.IndexOf(p);
+            if (idx >= 0 && idx < _standaloneProfiles.Count - 1)
+            {
+                _standaloneProfiles.Move(idx, idx + 1);
+                int allIdx = _profiles.IndexOf(p);
+                if (allIdx >= 0 && allIdx < _profiles.Count - 1) _profiles.Move(allIdx, allIdx + 1);
+                SaveSettings();
+            }
         }
     }
 
     private void MenuItem_Edit_Click(object sender, RoutedEventArgs e)
     {
-        if (LvProfiles?.SelectedItem is VpnProfile p)
+        if (GetContextMenuProfile(sender) is { } p)
         {
             _editingProfile = p;
             _manualInputValues["Name"] = p.Name;
@@ -2189,7 +6233,7 @@ public partial class MainWindow : Window
             _manualInputValues["ObfsPassword"] = p.ObfsPassword;
             _manualInputValues["Insecure"] = p.Insecure ? "true" : "false";
 
-            if (TxtImportTitle != null) TxtImportTitle.Text = GetString("Lang_CtxEdit");
+            if (TxtImportTitle != null) TxtImportTitle.Text = L("EditTitle");
 
             if (BtnPasteImport != null) BtnPasteImport.Visibility = Visibility.Collapsed;
             if (ImportSeparator != null) ImportSeparator.Visibility = Visibility.Collapsed;
@@ -2210,11 +6254,21 @@ public partial class MainWindow : Window
         }
     }
 
-    private void MenuItem_Delete_Click(object sender, RoutedEventArgs e)
+    private async void MenuItem_Delete_Click(object sender, RoutedEventArgs e)
     {
-        if (LvProfiles?.SelectedItem is VpnProfile p)
+        if (GetContextMenuProfile(sender) is { } p)
         {
+            bool wasActive = ActiveProfile == p;
             _profiles.Remove(p);
+            _standaloneProfiles.Remove(p);
+            foreach (var sub in _subscriptions) sub.Profiles.Remove(p);
+
+            if (wasActive)
+            {
+                ActiveProfile = _standaloneProfiles.FirstOrDefault() ?? _profiles.FirstOrDefault();
+                RefreshAllVisualIndicators();
+                if (_isRunning) await StopVPNAsync();
+            }
             SaveSettings();
             UpdateEmptyState();
         }
@@ -2228,19 +6282,27 @@ public partial class MainWindow : Window
         if (!string.IsNullOrWhiteSpace(text))
         {
             Clipboard.SetText(text);
-            ShowNotification(GetString("Lang_MsgCopied"));
+            ShowNotification(L("NotifyCopied"));
         }
     }
 
     private void BtnClearLogs_Click(object sender, RoutedEventArgs e)
     {
         ConsoleParagraph?.Inlines.Clear();
-        _logBuffer.Clear();
+        lock (_logLock)
+        {
+            _logBuffer.Clear();
+        }
     }
 
     private void Log(string? message)
     {
         if (string.IsNullOrWhiteSpace(message)) return;
+        if (message.Contains("FATAL", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("ERROR", StringComparison.OrdinalIgnoreCase))
+        {
+            _lastCoreError = Regex.Replace(message, @"\x1B\[[0-9;]*m", "").Trim();
+        }
         lock (_logLock)
         {
             _logBuffer.Enqueue(message);
@@ -2303,12 +6365,12 @@ public partial class MainWindow : Window
                             isDefaultColor = false;
                             currentCustomBrush = code switch
                             {
-                                _ when code.Contains("31") => new SolidColorBrush(Color.FromRgb(248, 113, 113)),
-                                _ when code.Contains("32") => new SolidColorBrush(Color.FromRgb(74, 222, 128)),
-                                _ when code.Contains("33") => new SolidColorBrush(Color.FromRgb(250, 204, 21)),
+                                _ when code.Contains("31") || code.Contains("91") => new SolidColorBrush(Color.FromRgb(248, 113, 113)),
+                                _ when code.Contains("32") || code.Contains("92") => new SolidColorBrush(Color.FromRgb(74, 222, 128)),
+                                _ when code.Contains("33") || code.Contains("93") => new SolidColorBrush(Color.FromRgb(250, 204, 21)),
                                 _ when code.Contains("36") || code.Contains("96") => new SolidColorBrush(Color.FromRgb(56, 189, 248)),
-                                _ when code.Contains("34") => new SolidColorBrush(Color.FromRgb(96, 165, 250)),
-                                _ when code.Contains("35") => new SolidColorBrush(Color.FromRgb(232, 121, 249)),
+                                _ when code.Contains("34") || code.Contains("94") => new SolidColorBrush(Color.FromRgb(96, 165, 250)),
+                                _ when code.Contains("35") || code.Contains("95") => new SolidColorBrush(Color.FromRgb(232, 121, 249)),
                                 _ when code.Contains("90") => new SolidColorBrush(Color.FromRgb(156, 163, 175)),
                                 _ => null
                             };
@@ -2332,14 +6394,24 @@ public partial class MainWindow : Window
             TxtConsole.ScrollToEnd();
     }
 
-    private static async Task<string> GetCurrentIpAsync(HttpClientHandler? handler)
+    private static async Task<string> GetCurrentIpAsync(HttpClientHandler? handler, CancellationToken ct = default)
     {
         try
         {
-            using var client = handler != null ? new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(4) } : new HttpClient { Timeout = TimeSpan.FromSeconds(4) };
-            string response = await client.GetStringAsync("http://ip-api.com/json/?lang=en");
+            using var client = handler != null
+                ? new HttpClient(handler) { Timeout = TimeSpan.FromMilliseconds(2000) }
+                : new HttpClient(new HttpClientHandler { UseProxy = false }) { Timeout = TimeSpan.FromMilliseconds(1500) };
+
+            try
+            {
+                string ip = (await client.GetStringAsync("https://api.ipify.org", ct)).Trim();
+                if (IPAddress.TryParse(ip, out _)) return ip;
+            }
+            catch { }
+
+            string response = await client.GetStringAsync("https://ipinfo.io/json", ct);
             using var doc = JsonDocument.Parse(response);
-            return doc.RootElement.TryGetProperty("query", out var q) ? q.GetString() ?? "" : "";
+            return doc.RootElement.TryGetProperty("ip", out var q) ? q.GetString() ?? "" : "";
         }
         catch { return ""; }
     }
@@ -2351,8 +6423,34 @@ public partial class MainWindow : Window
         {
             if (NetworkInterface.GetIsNetworkAvailable())
             {
+                var upInterfaces = NetworkInterface.GetAllNetworkInterfaces()
+                    .Where(n => n.NetworkInterfaceType != NetworkInterfaceType.Loopback && n.OperationalStatus == OperationalStatus.Up)
+                    .ToList();
+
+                NetworkInterface[] targetInterfaces;
+                if (_currentSettings.Mode != "Proxy")
+                {
+                    var tunIfaces = upInterfaces
+                        .Where(n => n.Description.Contains("Wintun", StringComparison.OrdinalIgnoreCase) ||
+                                    n.Name.Contains("tun", StringComparison.OrdinalIgnoreCase) ||
+                                    n.Name.Contains("sing-box", StringComparison.OrdinalIgnoreCase) ||
+                                    n.Name.Contains("NeonV", StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+
+                    targetInterfaces = tunIfaces.Length > 0
+                        ? tunIfaces
+                        : upInterfaces.Where(n => n.NetworkInterfaceType != NetworkInterfaceType.Tunnel).ToArray();
+                }
+                else
+                {
+                    targetInterfaces = upInterfaces
+                        .Where(n => n.NetworkInterfaceType != NetworkInterfaceType.Tunnel &&
+                                    !n.Description.Contains("Wintun", StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+                }
+
                 long bytesR = 0, bytesS = 0;
-                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces().Where(n => n.NetworkInterfaceType != NetworkInterfaceType.Loopback && n.OperationalStatus == OperationalStatus.Up))
+                foreach (var ni in targetInterfaces)
                 {
                     var stats = ni.GetIPv4Statistics();
                     bytesR += stats.BytesReceived;
@@ -2381,88 +6479,255 @@ public partial class MainWindow : Window
         _ => $"{bytes} B/s"
     };
 
+    private void AnimateToggleButtonPulse()
+    {
+        if (_currentSettings.DisableAnimations || BtnToggle?.RenderTransform is not ScaleTransform scale) return;
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+        scale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation { From = 0.97, To = 1.0, Duration = GetDuration(0.22), EasingFunction = ease });
+        scale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation { From = 0.97, To = 1.0, Duration = GetDuration(0.22), EasingFunction = ease });
+    }
+
     private async void BtnToggle_Click(object sender, RoutedEventArgs e) => await ToggleVpnAsync();
 
     private async Task ToggleVpnAsync()
     {
-        if (BtnToggle != null) BtnToggle.IsEnabled = false;
-        if (_trayToggleItem != null) _trayToggleItem.Enabled = false;
+        await _vpnStateSemaphore.WaitAsync();
+        try
+        {
+            if (BtnToggle != null) BtnToggle.IsEnabled = false;
+            if (_trayToggleItem != null) _trayToggleItem.Enabled = false;
 
-        if (_isRunning) await StopVPNAsync();
-        else await StartVPNAsync();
-
-        if (BtnToggle != null) BtnToggle.IsEnabled = true;
-        if (_trayToggleItem != null) _trayToggleItem.Enabled = true;
+            if (_isRunning) await StopVpnCoreAsync();
+            else await StartVpnCoreAsync();
+        }
+        finally
+        {
+            if (BtnToggle != null) BtnToggle.IsEnabled = true;
+            if (_trayToggleItem != null) _trayToggleItem.Enabled = true;
+            _vpnStateSemaphore.Release();
+        }
     }
 
     private async Task StartVPNAsync()
     {
-        if (LvProfiles?.SelectedItem is not VpnProfile selectedProfile)
+        await _vpnStateSemaphore.WaitAsync();
+        try
         {
-            ShowNotification(GetString("Lang_ErrSelectProfile"), true);
+            if (BtnToggle != null) BtnToggle.IsEnabled = false;
+            if (_trayToggleItem != null) _trayToggleItem.Enabled = false;
+            await StartVpnCoreAsync();
+        }
+        finally
+        {
+            if (BtnToggle != null) BtnToggle.IsEnabled = true;
+            if (_trayToggleItem != null) _trayToggleItem.Enabled = true;
+            _vpnStateSemaphore.Release();
+        }
+    }
+
+    private async Task StopVPNAsync()
+    {
+        await _vpnStateSemaphore.WaitAsync();
+        try
+        {
+            if (BtnToggle != null) BtnToggle.IsEnabled = false;
+            if (_trayToggleItem != null) _trayToggleItem.Enabled = false;
+            await StopVpnCoreAsync();
+        }
+        finally
+        {
+            if (BtnToggle != null) BtnToggle.IsEnabled = true;
+            if (_trayToggleItem != null) _trayToggleItem.Enabled = true;
+            _vpnStateSemaphore.Release();
+        }
+    }
+
+    private async Task StartVpnCoreAsync()
+    {
+        var targetProfile = ActiveProfile ?? _standaloneProfiles.FirstOrDefault() ?? _profiles.FirstOrDefault();
+
+        if (targetProfile == null)
+        {
+            ShowNotification(L("NotifySelectProfile"), true);
             return;
         }
 
-        if (_currentSettings.Mode != "Proxy" && !File.Exists(Path.Combine(_baseDirectory, "wintun.dll")))
+        ActiveProfile = targetProfile;
+        RefreshAllVisualIndicators();
+
+        if (_currentSettings.Mode != "Proxy" && !IsAdministrator())
         {
-            ShowNotification(GetString("Lang_ErrWintun"), true);
+            ShowNotification(L("NotifyAdminRequired"), true);
             return;
         }
 
+        if (_currentSettings.Mode != "Proxy" && !File.Exists(Path.Combine(_exeDirectory, "wintun.dll")))
+        {
+            ShowNotification(L("NotifyWintunMissing"), true);
+            return;
+        }
+
+        KillOrphanedSingboxProcesses();
+
+        _lastCoreError = "";
+        _lastLocationCountryCode = "";
+        _lastLocationApiName = null;
         ConsoleParagraph?.Inlines.Clear();
-        Log($"[NeonV] Connecting to: {selectedProfile.Name} ({_currentSettings.Mode} Mode)...");
+        Log($"[NeonV] Connecting to: {targetProfile.Name} ({_currentSettings.Mode} Mode)...");
         _originalIp = await GetCurrentIpAsync(null);
 
         try
         {
-            if (!_currentSettings.UseCustomConfig || !File.Exists(Path.Combine(_baseDirectory, "config.json")))
+            _runningDns = string.IsNullOrWhiteSpace(_currentSettings.RemoteDns) ? "8.8.8.8" : _currentSettings.RemoteDns.Trim();
+            _runningDirectDns = string.IsNullOrWhiteSpace(_currentSettings.DirectDns) ? "77.88.8.8" : _currentSettings.DirectDns.Trim();
+            _runningConfiguredProxyPort = _currentSettings.ProxyPort > 0 ? _currentSettings.ProxyPort : 2080;
+            int effectiveProxyPort = _runningConfiguredProxyPort;
+
+            if (_currentSettings.Mode == "Proxy" && (!_currentSettings.UseCustomConfig || !File.Exists(Path.Combine(_exeDirectory, "config.json"))))
             {
-                await Task.Run(() => File.WriteAllText(Path.Combine(_baseDirectory, "config.json"), GenerateJsonConfig(selectedProfile, _currentSettings.RemoteDns)));
+                IPAddress listenIp = _currentSettings.AllowLan ? IPAddress.Any : IPAddress.Loopback;
+                bool portFree = false;
+                for (int i = 0; i < 20; i++)
+                {
+                    if (CanBindTcpPort(listenIp, effectiveProxyPort))
+                    {
+                        portFree = true;
+                        break;
+                    }
+                    await Task.Delay(100);
+                }
+
+                if (!portFree)
+                {
+                    int fallbackPort = FindFreeTcpPort(listenIp);
+                    if (fallbackPort > 0)
+                    {
+                        Log($"[NeonV] Port {effectiveProxyPort} is already in use, using port {fallbackPort}...");
+                        ShowNotification(string.Format(L("NotifyPortBusyFallbackFmt"), effectiveProxyPort, fallbackPort));
+                        effectiveProxyPort = fallbackPort;
+                    }
+                }
             }
 
-            _singboxProcess = new Process
+            _runningProxyPort = effectiveProxyPort;
+
+            if (_currentSettings.Mode != "Proxy")
+                _currentTunInterfaceName = SelectAvailableTunInterfaceName();
+
+            Process? activeProc = null;
+
+            for (int attempt = 0; attempt < 2; attempt++)
             {
-                StartInfo = new ProcessStartInfo
+                _lastCoreError = "";
+
+                if (!_currentSettings.UseCustomConfig || !File.Exists(Path.Combine(_exeDirectory, "config.json")))
                 {
-                    FileName = Path.Combine(_baseDirectory, "sing-box.exe"),
-                    Arguments = "run -c config.json",
-                    WorkingDirectory = _baseDirectory,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
+                    await File.WriteAllTextAsync(
+                        Path.Combine(_exeDirectory, "config.json"),
+                        GenerateJsonConfig(targetProfile, _runningDns, _currentSettings.Mode, effectiveProxyPort));
+                }
+
+                var proc = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = Path.Combine(_exeDirectory, "sing-box.exe"),
+                        Arguments = $"run -c \"{Path.Combine(_exeDirectory, "config.json")}\"",
+                        WorkingDirectory = _exeDirectory,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true
+                    }
+                };
+                _singboxProcess = proc;
+
+                proc.OutputDataReceived += (_, ev) => Log(ev.Data);
+                proc.ErrorDataReceived += (_, ev) => Log(ev.Data);
+
+                proc.Start();
+                JobObjectManager.AddProcess(proc.Handle);
+
+                try { proc.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
+
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+
+                await Task.Delay(1500);
+                if (!proc.HasExited)
+                {
+                    activeProc = proc;
+                    break;
+                }
+
+                if (attempt == 0 &&
+                    _currentSettings.Mode != "Proxy" &&
+                    !_currentSettings.UseCustomConfig &&
+                    IsTunConflictError(_lastCoreError))
+                {
+                    _blockedTunNames.Add(_currentTunInterfaceName);
+                    proc.Dispose();
+                    _singboxProcess = null;
+                    KillOrphanedSingboxProcesses();
+
+                    var existing = GetExistingAdapterNames();
+                    do
+                    {
+                        _currentTunInterfaceName = $"NeonV-{Guid.NewGuid().ToString("N")[..4]}";
+                    }
+                    while (existing.Contains(_currentTunInterfaceName) || _blockedTunNames.Contains(_currentTunInterfaceName));
+
+                    Log($"[NeonV] TUN adapter conflict detected, retrying with interface '{_currentTunInterfaceName}'...");
+                    continue;
+                }
+
+                string detail = string.IsNullOrEmpty(_lastCoreError)
+                    ? L("NotifyCoreExited")
+                    : $"{L("NotifyCoreExited")}\n{_lastCoreError}";
+                throw new Exception(detail);
+            }
+
+            if (activeProc == null)
+                throw new Exception(L("NotifyCoreExited"));
+
+            activeProc.EnableRaisingEvents = true;
+            activeProc.Exited += (_, _) =>
+            {
+                if (_singboxProcess == activeProc && _isRunning)
+                {
+                    Dispatcher.InvokeAsync(async () =>
+                    {
+                        if (_singboxProcess == activeProc && _isRunning)
+                        {
+                            ShowNotification(L("NotifyCoreExited"), true);
+                            await StopVPNAsync();
+                        }
+                    });
                 }
             };
 
-            _singboxProcess.OutputDataReceived += (_, ev) => Log(ev.Data);
-            _singboxProcess.ErrorDataReceived += (_, ev) => Log(ev.Data);
-
-            _singboxProcess.Start();
-            try { _singboxProcess.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
-
-            _singboxProcess.BeginOutputReadLine();
-            _singboxProcess.BeginErrorReadLine();
-
-            await Task.Delay(1500);
-            if (_singboxProcess.HasExited) throw new Exception(GetString("Lang_ErrCrash"));
-
             _isRunning = true;
             IsVpnRunning = true;
-            ActiveProfile = selectedProfile;
             _lastBytesReceived = 0;
             _lastBytesSent = 0;
 
             if (_currentSettings.Mode == "Proxy")
-                SystemProxyManager.EnableProxy($"127.0.0.1:{(_currentSettings.ProxyPort > 0 ? _currentSettings.ProxyPort : 2080)}");
+                SystemProxyManager.EnableProxy($"127.0.0.1:{_runningProxyPort}");
 
             UpdateButtonText();
+            AnimateToggleButtonPulse();
             UpdateTrayIconImage(true);
             Log("[NeonV] Running successfully!");
 
             _connectionStartTime = DateTime.Now;
             if (TxtConnectionTime != null) TxtConnectionTime.Text = "...";
+            if (TxtSpeedDown != null) TxtSpeedDown.Text = "↓ 0 B/s";
+            if (TxtSpeedUp != null) TxtSpeedUp.Text = "↑ 0 B/s";
+            if (TxtLocation != null) TxtLocation.Text = "...";
+            if (ImgFlag != null) { ImgFlag.Source = null; ImgFlag.Visibility = Visibility.Collapsed; }
+            if (IconLocation != null) IconLocation.Visibility = Visibility.Visible;
 
-            _uptimeTimer.Start();
+            _uptimeTimer?.Start();
             AnimateLocationBadge(true);
             _ = FetchLocationAsync();
         }
@@ -2470,37 +6735,41 @@ public partial class MainWindow : Window
         {
             Log($"[ERROR] {ex.Message}");
             ShowNotification(ex.Message, true);
-            await StopVPNAsync();
+            await StopVpnCoreAsync();
         }
     }
 
-    private async Task StopVPNAsync()
+    private async Task StopVpnCoreAsync()
     {
+        _locationCts?.Cancel();
         AnimateLocationBadge(false);
         Log("[NeonV] Stopping...");
         SystemProxyManager.DisableProxy();
+
+        var procToStop = _singboxProcess;
+        _singboxProcess = null;
 
         await Task.Run(() =>
         {
             try
             {
-                if (_singboxProcess is { HasExited: false })
+                if (procToStop is { HasExited: false })
                 {
-                    _singboxProcess.Kill();
-                    _singboxProcess.WaitForExit(2000);
+                    procToStop.Kill(true);
+                    procToStop.WaitForExit(2000);
                 }
             }
             catch { }
+            KillOrphanedSingboxProcesses();
         });
 
-        _singboxProcess?.Dispose();
-        _singboxProcess = null;
+        procToStop?.Dispose();
         _isRunning = false;
         IsVpnRunning = false;
-        ActiveProfile = null;
-        _uptimeTimer.Stop();
+        _uptimeTimer?.Stop();
 
         UpdateButtonText();
+        AnimateToggleButtonPulse();
         UpdateTrayIconImage(false);
 
         PingManager.Clear();
@@ -2514,81 +6783,198 @@ public partial class MainWindow : Window
             if (LocationBadge != null)
             {
                 var cubicEase = new CubicEase { EasingMode = EasingMode.EaseOut };
-                LocationBadge.BeginAnimation(WidthProperty, new DoubleAnimation { To = show ? 280 : 0, Duration = GetDuration(0.35), EasingFunction = cubicEase });
+                LocationBadge.BeginAnimation(MaxWidthProperty, new DoubleAnimation { To = show ? 360 : 0, Duration = GetDuration(0.35), EasingFunction = cubicEase });
                 LocationBadge.BeginAnimation(OpacityProperty, new DoubleAnimation { To = show ? 1 : 0, Duration = GetDuration(0.35), EasingFunction = cubicEase });
                 LocationBadge.BeginAnimation(MarginProperty, new ThicknessAnimation { To = show ? new Thickness(0, 0, 16, 0) : new Thickness(0), Duration = GetDuration(0.35), EasingFunction = cubicEase });
             }
         });
     }
 
+    private static async Task<(string ip, string countryCode, string apiCountry)> QueryExitGeoAsync(HttpClient client, CancellationToken ct)
+    {
+        try
+        {
+            string resp = await client.GetStringAsync($"https://ipinfo.io/json?_t={DateTime.UtcNow.Ticks}", ct);
+            using var doc = JsonDocument.Parse(resp);
+            var root = doc.RootElement;
+            string ip = root.TryGetProperty("ip", out var ipEl) ? ipEl.GetString() ?? "" : "";
+            string cc = root.TryGetProperty("country", out var ccEl) ? CountryFlagHelper.NormalizeCountryCode(ccEl.GetString() ?? "") : "";
+            if (!string.IsNullOrEmpty(ip) && !string.IsNullOrEmpty(cc))
+                return (ip, cc, "");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { }
+
+        try
+        {
+            string langParam = CurrentLanguage switch
+            {
+                "ru" or "en" or "de" or "ja" or "zh-CN" => CurrentLanguage,
+                _ => "en"
+            };
+            string resp = await client.GetStringAsync($"https://ipwho.is/?lang={langParam}&_t={DateTime.UtcNow.Ticks}", ct);
+            using var doc = JsonDocument.Parse(resp);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("success", out var ok) && ok.GetBoolean())
+            {
+                string ip = root.TryGetProperty("ip", out var ipEl) ? ipEl.GetString() ?? "" : "";
+                string cc = root.TryGetProperty("country_code", out var ccEl) ? CountryFlagHelper.NormalizeCountryCode(ccEl.GetString() ?? "") : "";
+                string country = root.TryGetProperty("country", out var cEl) ? cEl.GetString() ?? "" : "";
+                if (!string.IsNullOrEmpty(ip) && !string.IsNullOrEmpty(cc))
+                    return (ip, cc, country);
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { }
+
+        try
+        {
+            string langParam = CurrentLanguage switch
+            {
+                "ru" or "en" or "de" or "ja" or "zh-CN" => CurrentLanguage,
+                _ => "en"
+            };
+            string resp = await client.GetStringAsync($"http://ip-api.com/json/?lang={langParam}&_t={DateTime.UtcNow.Ticks}", ct);
+            using var doc = JsonDocument.Parse(resp);
+            var root = doc.RootElement;
+            string ip = root.TryGetProperty("query", out var qEl) ? qEl.GetString() ?? "" : "";
+            string cc = root.TryGetProperty("countryCode", out var ccEl) ? CountryFlagHelper.NormalizeCountryCode(ccEl.GetString() ?? "") : "";
+            string country = root.TryGetProperty("country", out var cEl) ? cEl.GetString() ?? "" : "";
+            if (!string.IsNullOrEmpty(ip) && !string.IsNullOrEmpty(cc))
+                return (ip, cc, country);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { }
+
+        return ("", "", "");
+    }
+
     private async Task FetchLocationAsync(bool immediate = false)
     {
+        _locationCts?.Cancel();
+        _locationCts = new CancellationTokenSource();
+        var ct = _locationCts.Token;
+
+        int activeProxyPort = _runningProxyPort > 0 ? _runningProxyPort : (_currentSettings.ProxyPort > 0 ? _currentSettings.ProxyPort : 2080);
+
         await Task.Run(async () =>
         {
-            if (!immediate) await Task.Delay(2000);
-
-            for (int i = 0; i < 5; i++)
+            try
             {
-                try
+                if (!immediate) await Task.Delay(1200, ct);
+
+                for (int i = 0; i < 5; i++)
                 {
-                    Dispatcher.Invoke(() => { if (TxtLocation != null) TxtLocation.Text = "..."; });
+                    ct.ThrowIfCancellationRequested();
 
-                    HttpClientHandler handler = new();
-                    if (_currentSettings.Mode == "Proxy")
+                    try
                     {
-                        handler.Proxy = new WebProxy("127.0.0.1", _currentSettings.ProxyPort > 0 ? _currentSettings.ProxyPort : 2080);
-                        handler.UseProxy = true;
-                    }
+                        Dispatcher.Invoke(() => { if (TxtLocation != null) TxtLocation.Text = "..."; });
 
-                    using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(6) };
-
-                    string apiLang = _currentSettings.Language switch
-                    {
-                        "ru" or "de" or "ja" => _currentSettings.Language,
-                        string l when l.StartsWith("zh") => "zh-CN",
-                        _ => "en"
-                    };
-
-                    string response = await client.GetStringAsync($"http://ip-api.com/json/?lang={apiLang}&_t={DateTime.UtcNow.Ticks}");
-                    using var doc = JsonDocument.Parse(response);
-                    var root = doc.RootElement;
-                    string newIp = root.TryGetProperty("query", out var q) ? q.GetString() ?? "" : "";
-
-                    if (!immediate && newIp == _originalIp && !string.IsNullOrEmpty(_originalIp) && i < 4)
-                    {
-                        await Task.Delay(2500);
-                        continue;
-                    }
-
-                    string country = root.TryGetProperty("country", out var c) ? c.GetString() ?? GetString("Lang_LocUnknown") : GetString("Lang_LocUnknown");
-                    string countryCode = root.TryGetProperty("countryCode", out var cc) ? cc.GetString() ?? "" : "";
-
-                    Dispatcher.Invoke(() =>
-                    {
-                        if (TxtLocation != null) TxtLocation.Text = country;
-                        if (countryCode.Length == 2)
+                        HttpClientHandler handler = new();
+                        if (_currentSettings.Mode == "Proxy")
                         {
-                            try
-                            {
-                                if (ImgFlag != null)
-                                {
-                                    ImgFlag.Source = new BitmapImage(new Uri($"https://flagcdn.com/w40/{countryCode.ToLower()}.png"));
-                                    ImgFlag.Visibility = Visibility.Visible;
-                                }
-                                if (IconLocation != null) IconLocation.Visibility = Visibility.Collapsed;
-                            }
-                            catch { }
+                            handler.Proxy = new WebProxy("127.0.0.1", activeProxyPort);
+                            handler.UseProxy = true;
                         }
-                    });
-                    return;
-                }
-                catch
-                {
-                    if (i == 4) Dispatcher.Invoke(() => { if (TxtLocation != null) TxtLocation.Text = GetString("Lang_LocUnknown"); });
-                    else await Task.Delay(2000);
+                        else
+                        {
+                            handler.UseProxy = false;
+                        }
+
+                        using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(6) };
+
+                        var (newIp, countryCode, apiCountry) = await QueryExitGeoAsync(client, ct);
+                        if (string.IsNullOrEmpty(countryCode))
+                        {
+                            if (i == 4)
+                            {
+                                Dispatcher.Invoke(() =>
+                                {
+                                    if (!ct.IsCancellationRequested && TxtLocation != null)
+                                        TxtLocation.Text = L("UnknownLocation");
+                                });
+                            }
+                            else
+                            {
+                                await Task.Delay(2000, ct);
+                            }
+                            continue;
+                        }
+
+                        if (!immediate && newIp == _originalIp && !string.IsNullOrEmpty(_originalIp) && i < 4)
+                        {
+                            await Task.Delay(2500, ct);
+                            continue;
+                        }
+
+                        if (ct.IsCancellationRequested || !_isRunning) return;
+
+                        _lastLocationCountryCode = countryCode;
+                        _lastLocationApiName = apiCountry;
+                        string localizedCountry = LocalizeCountryName(countryCode, apiCountry);
+
+                        byte[]? flagBytes = null;
+                        try
+                        {
+                            flagBytes = await client.GetByteArrayAsync($"https://flagcdn.com/w40/{countryCode.ToLowerInvariant()}.png", ct);
+                        }
+                        catch { }
+
+                        Dispatcher.Invoke(() =>
+                        {
+                            if (ct.IsCancellationRequested || !_isRunning) return;
+
+                            if (TxtLocation != null)
+                            {
+                                TxtLocation.Text = localizedCountry;
+                                TxtLocation.BeginAnimation(OpacityProperty, new DoubleAnimation { From = 0.2, To = 1, Duration = GetDuration(0.25) });
+                            }
+                            if (flagBytes != null && flagBytes.Length > 0)
+                            {
+                                try
+                                {
+                                    using var ms = new MemoryStream(flagBytes);
+                                    var bmp = new BitmapImage();
+                                    bmp.BeginInit();
+                                    bmp.CacheOption = BitmapCacheOption.OnLoad;
+                                    bmp.StreamSource = ms;
+                                    bmp.EndInit();
+                                    bmp.Freeze();
+
+                                    if (ImgFlag != null)
+                                    {
+                                        ImgFlag.Source = bmp;
+                                        ImgFlag.Visibility = Visibility.Visible;
+                                        ImgFlag.BeginAnimation(OpacityProperty, new DoubleAnimation { From = 0, To = 1, Duration = GetDuration(0.25) });
+                                    }
+                                    if (IconLocation != null) IconLocation.Visibility = Visibility.Collapsed;
+                                }
+                                catch { }
+                            }
+                        });
+                        return;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                    catch
+                    {
+                        if (i == 4)
+                        {
+                            Dispatcher.Invoke(() =>
+                            {
+                                if (!ct.IsCancellationRequested && TxtLocation != null)
+                                    TxtLocation.Text = L("UnknownLocation");
+                            });
+                        }
+                        else await Task.Delay(2000, ct);
+                    }
                 }
             }
-        });
+            catch (OperationCanceledException) { }
+        }, ct);
     }
 
     private void Window_Closing(object sender, CancelEventArgs e)
@@ -2597,27 +6983,44 @@ public partial class MainWindow : Window
 
         if (!_isRealClose)
         {
-            e.Cancel = true;
-            Hide();
-            if (!_currentSettings.HasShownTrayNotification)
+            if (!_currentSettings.MinimizeToTray)
             {
-                _notifyIcon?.ShowBalloonTip(3000, "NeonV", GetString("Lang_TrayRunning"), Forms.ToolTipIcon.Info);
-                _currentSettings.HasShownTrayNotification = true;
-                SaveSettings();
+                _isRealClose = true;
             }
-            return;
+            else
+            {
+                e.Cancel = true;
+                Hide();
+                if (!_currentSettings.HasShownTrayNotification)
+                {
+                    _notifyIcon?.ShowBalloonTip(3000, "NeonV", L("TrayBgTip"), Forms.ToolTipIcon.Info);
+                    _currentSettings.HasShownTrayNotification = true;
+                    SaveSettings();
+                }
+                return;
+            }
         }
+
+        SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
+        _locationCts?.Cancel();
+        _notificationCts?.Cancel();
+        _uptimeTimer?.Stop();
+        _pingTimer?.Stop();
+        _logTimer?.Stop();
+        FlushSaveSettingsSync();
 
         SystemProxyManager.DisableProxy();
         try
         {
             if (_singboxProcess is { HasExited: false })
             {
-                _singboxProcess.Kill();
+                _singboxProcess.Kill(true);
                 _singboxProcess.WaitForExit(2000);
             }
         }
         catch { }
+        KillOrphanedSingboxProcesses();
+        Direct2DEmojiRenderer.Dispose();
 
         if (_notifyIcon != null)
         {
@@ -2626,126 +7029,299 @@ public partial class MainWindow : Window
         }
     }
 
-    private string GenerateJsonConfig(VpnProfile p, string customDns)
+    private static void ApplyTransport(Dictionary<string, object> outbound, VpnProfile p)
+    {
+        string type = (p.Transport ?? "").Trim().ToLowerInvariant();
+        if (type == "h2") type = "http";
+        if (string.IsNullOrEmpty(type) || type is "tcp" or "raw" or "none") return;
+
+        var transport = new Dictionary<string, object> { ["type"] = type };
+        if (type == "ws")
+        {
+            transport["path"] = string.IsNullOrEmpty(p.Path) ? "/" : p.Path;
+            if (!string.IsNullOrEmpty(p.Host)) transport["headers"] = new Dictionary<string, string> { ["Host"] = p.Host };
+        }
+        else if (type == "grpc")
+        {
+            if (!string.IsNullOrEmpty(p.Path)) transport["service_name"] = p.Path;
+        }
+        else if (type == "http")
+        {
+            transport["path"] = string.IsNullOrEmpty(p.Path) ? "/" : p.Path;
+            if (!string.IsNullOrEmpty(p.Host)) transport["host"] = new[] { p.Host };
+        }
+        else if (type == "httpupgrade")
+        {
+            transport["path"] = string.IsNullOrEmpty(p.Path) ? "/" : p.Path;
+            if (!string.IsNullOrEmpty(p.Host)) transport["host"] = p.Host;
+        }
+        outbound["transport"] = transport;
+    }
+
+    private static Dictionary<string, object> BuildDnsServer(string tag, string input, string? detour)
+    {
+        var server = new Dictionary<string, object> { ["tag"] = tag };
+        string fallbackIp = tag == "direct-dns" ? "77.88.8.8" : "8.8.8.8";
+        string trimmed = string.IsNullOrWhiteSpace(input) ? fallbackIp : input.Trim();
+
+        if (trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase) && Uri.TryCreate(trimmed, UriKind.Absolute, out var httpsUri))
+        {
+            if (tag == "direct-dns" && !IPAddress.TryParse(httpsUri.Host, out _))
+            {
+                server["type"] = "local";
+            }
+            else
+            {
+                server["type"] = "https";
+                server["server"] = httpsUri.Host;
+                if (httpsUri.Port > 0) server["server_port"] = httpsUri.Port;
+                if (!string.IsNullOrEmpty(httpsUri.AbsolutePath) && httpsUri.AbsolutePath != "/")
+                    server["path"] = httpsUri.AbsolutePath;
+                if (!IPAddress.TryParse(httpsUri.Host, out _) && tag != "direct-dns")
+                    server["domain_resolver"] = "direct-dns";
+            }
+        }
+        else if (trimmed.StartsWith("tls://", StringComparison.OrdinalIgnoreCase) && Uri.TryCreate(trimmed, UriKind.Absolute, out var tlsUri))
+        {
+            if (tag == "direct-dns" && !IPAddress.TryParse(tlsUri.Host, out _))
+            {
+                server["type"] = "local";
+            }
+            else
+            {
+                server["type"] = "tls";
+                server["server"] = tlsUri.Host;
+                if (tlsUri.Port > 0) server["server_port"] = tlsUri.Port;
+                if (!IPAddress.TryParse(tlsUri.Host, out _) && tag != "direct-dns")
+                    server["domain_resolver"] = "direct-dns";
+            }
+        }
+        else if (IPAddress.TryParse(trimmed, out _))
+        {
+            server["type"] = "udp";
+            server["server"] = trimmed;
+            server["server_port"] = 53;
+        }
+        else
+        {
+            server["type"] = "udp";
+            server["server"] = fallbackIp;
+            server["server_port"] = 53;
+        }
+
+        if (!string.IsNullOrEmpty(detour))
+            server["detour"] = detour;
+
+        return server;
+    }
+
+    private static bool IsIpOrCidr(string value)
+    {
+        if (IPAddress.TryParse(value, out _)) return true;
+        int slash = value.IndexOf('/');
+        if (slash > 0 && IPAddress.TryParse(value[..slash], out _) && int.TryParse(value[(slash + 1)..], out int prefix) && prefix is >= 0 and <= 128)
+            return true;
+        return false;
+    }
+
+    private string GenerateJsonConfig(VpnProfile p, string customDns, string? overrideMode = null, int? overrideProxyPort = null)
     {
         if (string.IsNullOrWhiteSpace(customDns)) customDns = "8.8.8.8";
+        string directDns = string.IsNullOrWhiteSpace(_currentSettings.DirectDns) ? "77.88.8.8" : _currentSettings.DirectDns.Trim();
+        string mode = overrideMode ?? _currentSettings.Mode;
+        int proxyPort = overrideProxyPort ?? (_currentSettings.ProxyPort > 0 ? _currentSettings.ProxyPort : 2080);
 
-        var outbound = new Dictionary<string, object>
-        {
-            ["type"] = p.Protocol,
-            ["tag"] = "proxy",
-            ["server"] = p.Address,
-            ["server_port"] = p.Port
-        };
+        Dictionary<string, object>? wireguardEndpoint = null;
+        Dictionary<string, object>? proxyOutbound = null;
 
-        if (p.Protocol == "vless")
+        if (p.Protocol == "wireguard")
         {
-            outbound["uuid"] = p.Uuid;
-            if (!string.IsNullOrEmpty(p.Flow)) outbound["flow"] = p.Flow;
-            outbound["tls"] = BuildTlsConfig(p);
-        }
-        else if (p.Protocol == "vmess")
-        {
-            outbound["uuid"] = p.Uuid;
-            outbound["alter_id"] = p.AlterId;
-            outbound["security"] = string.IsNullOrEmpty(p.Security) ? "auto" : p.Security;
+            var wgAddresses = (string.IsNullOrEmpty(p.LocalAddress) ? "10.0.0.2/32" : p.LocalAddress)
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(a => a.Contains('/') ? a : $"{a}/32")
+                .ToArray();
 
-            if (p.Transport != "tcp" && !string.IsNullOrEmpty(p.Transport))
+            wireguardEndpoint = new Dictionary<string, object>
             {
-                var transport = new Dictionary<string, object> { ["type"] = p.Transport };
-                if (p.Transport == "ws")
+                ["type"] = "wireguard",
+                ["tag"] = "proxy",
+                ["system"] = false,
+                ["mtu"] = p.Mtu > 0 ? p.Mtu : 1420,
+                ["address"] = wgAddresses,
+                ["private_key"] = p.PrivateKey,
+                ["domain_resolver"] = "direct-dns",
+                ["peers"] = new[]
                 {
-                    transport["path"] = string.IsNullOrEmpty(p.Path) ? "/" : p.Path;
-                    if (!string.IsNullOrEmpty(p.Host)) transport["headers"] = new Dictionary<string, string> { ["Host"] = p.Host };
+                    new Dictionary<string, object>
+                    {
+                        ["address"] = p.Address,
+                        ["port"] = p.Port,
+                        ["public_key"] = p.PublicKey,
+                        ["allowed_ips"] = new[] { "0.0.0.0/0", "::/0" },
+                        ["persistent_keepalive_interval"] = 25
+                    }
                 }
-                outbound["transport"] = transport;
-            }
-            if (p.Security == "tls" || p.Port == 443) outbound["tls"] = BuildTlsConfig(p);
+            };
         }
-        else if (p.Protocol == "trojan")
+        else
         {
-            outbound["password"] = p.Password;
-            outbound["tls"] = BuildTlsConfig(p);
-        }
-        else if (p.Protocol == "shadowsocks")
-        {
-            outbound["method"] = string.IsNullOrEmpty(p.Method) ? "chacha20-ietf-poly1305" : p.Method;
-            outbound["password"] = p.Password;
-        }
-        else if (p.Protocol == "wireguard")
-        {
-            outbound["local_address"] = new[] { string.IsNullOrEmpty(p.LocalAddress) ? "10.0.0.2/32" : p.LocalAddress };
-            outbound["private_key"] = p.PrivateKey;
-            outbound["peer_public_key"] = p.PublicKey;
-            outbound["mtu"] = p.Mtu > 0 ? p.Mtu : 1420;
-        }
-        else if (p.Protocol is "hysteria" or "hysteria2")
-        {
-            if (p.Protocol == "hysteria2") outbound["password"] = p.Password;
-            else outbound["auth_str"] = p.Password;
-
-            if (!string.IsNullOrEmpty(p.Up)) outbound["up_mbps"] = int.TryParse(p.Up, out var up) ? up : 100;
-            if (!string.IsNullOrEmpty(p.Down)) outbound["down_mbps"] = int.TryParse(p.Down, out var dn) ? dn : 100;
-
-            if (!string.IsNullOrEmpty(p.Obfs))
+            var outbound = new Dictionary<string, object>
             {
-                if (p.Protocol == "hysteria2") outbound["obfs"] = new { type = "salamander", password = p.ObfsPassword };
-                else outbound["obfs"] = p.Obfs;
+                ["type"] = p.Protocol,
+                ["tag"] = "proxy",
+                ["server"] = p.Address,
+                ["server_port"] = p.Port
+            };
+
+            if (p.Protocol == "vless")
+            {
+                outbound["uuid"] = p.Uuid;
+                bool hasTls = p.Security != "none" && (p.Security is "tls" or "reality" || p.Port == 443 || !string.IsNullOrEmpty(p.Pbk) || !string.IsNullOrEmpty(p.Sni));
+                if (hasTls) outbound["tls"] = BuildTlsConfig(p, isQuic: false, allowReality: true);
+
+                string tr = (p.Transport ?? "").Trim().ToLowerInvariant();
+                bool isTcpTransport = string.IsNullOrEmpty(tr) || tr is "tcp" or "raw" or "none";
+                if (hasTls && isTcpTransport && !string.IsNullOrEmpty(p.Flow))
+                {
+                    string flow = p.Flow.EndsWith("-udp443", StringComparison.OrdinalIgnoreCase) ? p.Flow[..^7] : p.Flow;
+                    if (!string.IsNullOrEmpty(flow)) outbound["flow"] = flow;
+                }
+
+                ApplyTransport(outbound, p);
             }
-            outbound["tls"] = BuildTlsConfig(p, true);
-        }
-        else if (p.Protocol == "tuic")
-        {
-            outbound["uuid"] = p.Uuid;
-            outbound["password"] = p.Password;
-            outbound["tls"] = BuildTlsConfig(p, true);
-        }
-        else if (p.Protocol is "socks" or "http" && !string.IsNullOrEmpty(p.Uuid))
-        {
-            outbound["username"] = p.Uuid;
-            outbound["password"] = p.Password;
+            else if (p.Protocol == "vmess")
+            {
+                outbound["uuid"] = p.Uuid;
+                outbound["alter_id"] = p.AlterId;
+                outbound["security"] = string.IsNullOrEmpty(p.Security) || p.Security is "tls" or "reality" ? "auto" : p.Security;
+                if (p.Security is "tls" || (p.Security != "none" && (p.Port == 443 || !string.IsNullOrEmpty(p.Sni))))
+                    outbound["tls"] = BuildTlsConfig(p, isQuic: false, allowReality: false);
+
+                ApplyTransport(outbound, p);
+            }
+            else if (p.Protocol == "trojan")
+            {
+                outbound["password"] = p.Password;
+                if (p.Security != "none")
+                    outbound["tls"] = BuildTlsConfig(p, isQuic: false, allowReality: false);
+
+                ApplyTransport(outbound, p);
+            }
+            else if (p.Protocol == "shadowsocks")
+            {
+                outbound["method"] = string.IsNullOrEmpty(p.Method) ? "chacha20-ietf-poly1305" : p.Method;
+                outbound["password"] = p.Password;
+            }
+            else if (p.Protocol is "hysteria" or "hysteria2")
+            {
+                if (p.Protocol == "hysteria2") outbound["password"] = p.Password;
+                else outbound["auth_str"] = p.Password;
+
+                if (int.TryParse(Regex.Match(p.Up ?? "", @"\d+").Value, out var up) && up > 0) outbound["up_mbps"] = up;
+                else if (p.Protocol == "hysteria") outbound["up_mbps"] = 100;
+
+                if (int.TryParse(Regex.Match(p.Down ?? "", @"\d+").Value, out var dn) && dn > 0) outbound["down_mbps"] = dn;
+                else if (p.Protocol == "hysteria") outbound["down_mbps"] = 100;
+
+                if (!string.IsNullOrEmpty(p.Obfs) && !p.Obfs.Equals("none", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (p.Protocol == "hysteria2")
+                    {
+                        if (p.Obfs.Equals("salamander", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(p.ObfsPassword))
+                            outbound["obfs"] = new { type = "salamander", password = p.ObfsPassword };
+                        else if (p.Obfs.Equals("gecko", StringComparison.OrdinalIgnoreCase))
+                            outbound["obfs"] = new { type = "gecko" };
+                    }
+                    else
+                    {
+                        outbound["obfs"] = p.Obfs;
+                    }
+                }
+                outbound["tls"] = BuildTlsConfig(p, isQuic: true, allowReality: false);
+            }
+            else if (p.Protocol == "tuic")
+            {
+                outbound["uuid"] = p.Uuid;
+                outbound["password"] = p.Password;
+                outbound["congestion_control"] = "bbr";
+                outbound["tls"] = BuildTlsConfig(p, isQuic: true, allowReality: false);
+            }
+            else if (p.Protocol is "socks" or "http")
+            {
+                if (!string.IsNullOrEmpty(p.Uuid)) outbound["username"] = p.Uuid;
+                if (!string.IsNullOrEmpty(p.Password)) outbound["password"] = p.Password;
+                if (p.Protocol == "http" && p.Security == "tls") outbound["tls"] = BuildTlsConfig(p, isQuic: false, allowReality: false);
+            }
+
+            proxyOutbound = outbound;
         }
 
         var routeRules = new List<object>
         {
-            new { port = 53, action = "hijack-dns" },
+            new { action = "sniff" },
             new { protocol = "dns", action = "hijack-dns" },
-            new { ip_is_private = true, outbound = "direct" },
-            new { action = "sniff" }
+            new { ip_is_private = true, action = "route", outbound = "direct" }
         };
 
         var directIps = new HashSet<string>();
-        var directDomains = new HashSet<string>();
+        var directDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var profile in _profiles.Where(x => !string.IsNullOrWhiteSpace(x.Address)))
         {
-            if (IPAddress.TryParse(profile.Address, out var ip)) directIps.Add(ip.ToString());
-            else directDomains.Add(profile.Address);
+            string addr = profile.Address.Trim();
+            if (IPAddress.TryParse(addr, out var ip))
+            {
+                if (!ip.Equals(IPAddress.Any) && !ip.Equals(IPAddress.IPv6Any) && !IPAddress.IsLoopback(ip) && !ip.IsIPv6LinkLocal)
+                {
+                    if (ip.AddressFamily == AddressFamily.InterNetworkV6 && ip.ScopeId != 0)
+                        ip = new IPAddress(ip.GetAddressBytes());
+                    directIps.Add(ip.ToString());
+                }
+            }
+            else if (!addr.Contains(' ') && addr is not "localhost")
+            {
+                directDomains.Add(addr);
+            }
         }
 
-        if (directIps.Count > 0) routeRules.Add(new { ip_cidr = directIps.ToArray(), outbound = "direct" });
-        if (directDomains.Count > 0) routeRules.Add(new { domain = directDomains.ToArray(), outbound = "direct" });
+        if (directIps.Count > 0) routeRules.Add(new { ip_cidr = directIps.ToArray(), action = "route", outbound = "direct" });
+        if (directDomains.Count > 0) routeRules.Add(new { domain = directDomains.ToArray(), action = "route", outbound = "direct" });
 
         string ruleOutbound = _currentSettings.RouteMode == "Only" ? "proxy" : "direct";
         string finalOutbound = _currentSettings.RouteMode == "Only" ? "direct" : "proxy";
         string ruleDns = _currentSettings.RouteMode == "Only" ? "remote-dns" : "direct-dns";
         string finalDns = _currentSettings.RouteMode == "Only" ? "direct-dns" : "remote-dns";
 
-        routeRules.Add(new { domain_suffix = new[] { "ip-api.com", "flagcdn.com" }, outbound = "proxy" });
-        if (_currentSettings.RoutingDomains.Count != 0) routeRules.Add(new { domain_suffix = _currentSettings.RoutingDomains.ToArray(), outbound = ruleOutbound });
-        if (_currentSettings.RoutingApps.Count != 0) routeRules.Add(new { process_name = _currentSettings.RoutingApps.ToArray(), outbound = ruleOutbound });
+        routeRules.Add(new { domain_suffix = new[] { "ipinfo.io", "ipwho.is", "ip-api.com", "flagcdn.com", "cloudflare.com", "ipify.org" }, action = "route", outbound = "proxy" });
 
-        var dnsRules = new List<object> { new { domain_suffix = new[] { "ip-api.com", "flagcdn.com" }, server = "remote-dns" } };
-        if (_currentSettings.RoutingDomains.Count != 0) dnsRules.Add(new { domain_suffix = _currentSettings.RoutingDomains.ToArray(), server = ruleDns });
+        if (_currentSettings.BypassRuDomains && _currentSettings.RouteMode != "Only")
+            routeRules.Add(new { domain_suffix = new[] { ".ru", ".рф", ".xn--p1ai", ".su" }, action = "route", outbound = "direct" });
+
+        var routingIpCidrs = _currentSettings.RoutingDomains.Where(IsIpOrCidr).ToArray();
+        var routingDomainSuffixes = _currentSettings.RoutingDomains.Where(d => !IsIpOrCidr(d)).ToArray();
+
+        if (routingDomainSuffixes.Length > 0) routeRules.Add(new { domain_suffix = routingDomainSuffixes, action = "route", outbound = ruleOutbound });
+        if (routingIpCidrs.Length > 0) routeRules.Add(new { ip_cidr = routingIpCidrs, action = "route", outbound = ruleOutbound });
+        if (_currentSettings.RoutingApps.Count != 0) routeRules.Add(new { process_name = _currentSettings.RoutingApps.ToArray(), action = "route", outbound = ruleOutbound });
+
+        var dnsRules = new List<object>
+        {
+            new { domain_suffix = new[] { "ipinfo.io", "ipwho.is", "ip-api.com", "flagcdn.com", "cloudflare.com", "ipify.org" }, action = "route", server = "remote-dns" }
+        };
+
+        if (_currentSettings.BypassRuDomains && _currentSettings.RouteMode != "Only")
+            dnsRules.Add(new { domain_suffix = new[] { ".ru", ".рф", ".xn--p1ai", ".su" }, action = "route", server = "direct-dns" });
+
+        if (routingDomainSuffixes.Length > 0) dnsRules.Add(new { domain_suffix = routingDomainSuffixes, action = "route", server = ruleDns });
 
         var inbounds = new List<object>();
-        if (_currentSettings.Mode == "Proxy")
+        if (mode == "Proxy")
         {
             inbounds.Add(new
             {
                 type = "mixed",
                 tag = "mixed-in",
                 listen = _currentSettings.AllowLan ? "0.0.0.0" : "127.0.0.1",
-                listen_port = _currentSettings.ProxyPort > 0 ? _currentSettings.ProxyPort : 2080
+                listen_port = proxyPort
             });
         }
         else
@@ -2754,54 +7330,73 @@ public partial class MainWindow : Window
             {
                 type = "tun",
                 tag = "tun-in",
-                address = new[] { "172.19.0.1/30" },
+                interface_name = _currentTunInterfaceName,
+                address = _currentSettings.EnableIpv6 ? new[] { "172.19.0.1/30", "fdfe:dcba:9876::1/126" } : new[] { "172.19.0.1/30" },
                 auto_route = true,
-                strict_route = true,
-                endpoint_independent_nat = _currentSettings.AllowLan,
+                strict_route = _currentSettings.StrictRoute,
                 stack = string.IsNullOrEmpty(_currentSettings.TunStack) ? "system" : _currentSettings.TunStack
             });
         }
 
-        var root = new
+        var root = new Dictionary<string, object>
         {
-            log = new { level = string.IsNullOrEmpty(_currentSettings.LogLevel) ? "info" : _currentSettings.LogLevel, timestamp = true },
-            dns = new
+            ["log"] = new { level = string.IsNullOrEmpty(_currentSettings.LogLevel) ? "info" : _currentSettings.LogLevel, timestamp = true },
+            ["dns"] = new
             {
                 servers = new object[]
                 {
-                    new { tag = "remote-dns", type = "udp", server = customDns, server_port = 53, detour = "proxy" },
-                    new { tag = "direct-dns", type = "udp", server = "77.88.8.8", server_port = 53 }
+                    BuildDnsServer("remote-dns", customDns, "proxy"),
+                    BuildDnsServer("direct-dns", directDns, null)
                 },
                 rules = dnsRules.ToArray(),
                 final = finalDns,
-                independent_cache = true
+                strategy = (_currentSettings.EnableIpv6 || mode == "Proxy") ? "prefer_ipv4" : "ipv4_only"
             },
-            inbounds = inbounds.ToArray(),
-            outbounds = new object[] { outbound, new { type = "direct", tag = "direct" } },
-            route = new
-            {
-                rules = routeRules.ToArray(),
-                auto_detect_interface = _currentSettings.Mode != "Proxy",
-                final = finalOutbound,
-                default_domain_resolver = "direct-dns"
-            }
+            ["inbounds"] = inbounds.ToArray()
+        };
+
+        if (wireguardEndpoint != null)
+        {
+            root["endpoints"] = new object[] { wireguardEndpoint };
+            root["outbounds"] = new object[] { new { type = "direct", tag = "direct" } };
+        }
+        else
+        {
+            root["outbounds"] = new object[] { proxyOutbound!, new { type = "direct", tag = "direct" } };
+        }
+
+        root["route"] = new
+        {
+            rules = routeRules.ToArray(),
+            auto_detect_interface = mode != "Proxy",
+            final = finalOutbound,
+            default_domain_resolver = "direct-dns"
         };
 
         return JsonSerializer.Serialize(root, new JsonSerializerOptions { WriteIndented = true });
     }
 
-    private static object BuildTlsConfig(VpnProfile p, bool isUdpAlpn = false)
+    private static object BuildTlsConfig(VpnProfile p, bool isQuic = false, bool allowReality = true)
     {
         var tls = new Dictionary<string, object> { ["enabled"] = true };
         if (!string.IsNullOrEmpty(p.Sni)) tls["server_name"] = p.Sni;
-        if (isUdpAlpn && !string.IsNullOrEmpty(p.Alpn)) tls["alpn"] = new[] { p.Alpn };
-        if (!string.IsNullOrEmpty(p.Fp)) tls["utls"] = new { enabled = true, fingerprint = p.Fp };
-        if (!string.IsNullOrEmpty(p.Pbk)) tls["reality"] = new { enabled = true, public_key = p.Pbk, short_id = p.Sid };
+        if (!string.IsNullOrEmpty(p.Alpn))
+        {
+            var alpnList = p.Alpn.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (alpnList.Length > 0) tls["alpn"] = alpnList;
+        }
+        if (!isQuic)
+        {
+            string fp = p.Fp?.Equals("none", StringComparison.OrdinalIgnoreCase) == true ? "" : (p.Fp ?? "");
+            if (allowReality && !string.IsNullOrEmpty(p.Pbk) && string.IsNullOrEmpty(fp))
+                fp = "chrome";
+
+            if (!string.IsNullOrEmpty(fp)) tls["utls"] = new { enabled = true, fingerprint = fp };
+            if (allowReality && !string.IsNullOrEmpty(p.Pbk)) tls["reality"] = new { enabled = true, public_key = p.Pbk, short_id = p.Sid ?? "" };
+        }
         if (p.Insecure) tls["insecure"] = true;
         return tls;
     }
-
-    private Window? _fullScreenOverlay;
 
     private void BtnShowModels_Click(object sender, RoutedEventArgs e)
     {
@@ -2825,7 +7420,7 @@ public partial class MainWindow : Window
             Text = builder.ToString(),
             TextWrapping = TextWrapping.Wrap,
             FontSize = 11,
-            Foreground = (SolidColorBrush)FindResource("TextMutedColor"),
+            Foreground = TryFindResource("TextMutedColor") as Brush ?? Brushes.Gray,
             Opacity = 0.85,
             LineHeight = 16,
             FontFamily = new System.Windows.Media.FontFamily("Consolas")
@@ -2850,14 +7445,22 @@ public partial class MainWindow : Window
             ShowInTaskbar = false
         };
 
+        _fullScreenOverlay.Closed += (_, _) => _fullScreenOverlay = null;
         _fullScreenOverlay.PreviewMouseDown += (s, ev) =>
         {
-            _fullScreenOverlay.Close();
+            _fullScreenOverlay?.Close();
             _fullScreenOverlay = null;
+        };
+        _fullScreenOverlay.PreviewKeyDown += (s, ev) =>
+        {
+            if (ev.Key == Key.Escape)
+            {
+                _fullScreenOverlay?.Close();
+                _fullScreenOverlay = null;
+            }
         };
 
         _fullScreenOverlay.Content = scrollViewer;
         _fullScreenOverlay.Show();
     }
 }
-    
